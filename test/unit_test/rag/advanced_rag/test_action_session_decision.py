@@ -6,6 +6,7 @@ the batch to ``parse_failed``.
 """
 
 from rag.advanced_rag.harness.action_session import (
+    _init_retry_timeout,
     _parse_tool_decision_metadata,
     _validate_decision_entry,
 )
@@ -130,3 +131,16 @@ def test_validate_decision_entry_rejects_boolean_confidence():
         )
         is None
     )
+
+
+def test_init_retry_timeout_gets_longer_window():
+    # first attempt 45s bound; retry may use up to 2x/90s while staying inside deadline
+    assert _init_retry_timeout(45.0, 300.0) == 90.0
+    assert _init_retry_timeout(45.0, 80.0) == 75.0  # deadline-5 clamps
+
+
+def test_init_retry_timeout_never_shrinks_below_first():
+    # even a tight deadline keeps at least the first attempt's budget
+    assert _init_retry_timeout(45.0, 30.0) == 45.0
+    assert _init_retry_timeout(45.0, None) == 90.0
+    assert _init_retry_timeout(45.0, -1) == 90.0
