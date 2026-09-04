@@ -244,7 +244,7 @@ _LIST_CHUNKS_TOOL_SPEC = {
     },
 }
 
-_SEARCH_CHUNKS_TOOL_SPEC = {
+_SEARCH_CHUNKS_TOOL_SPEC = {##要修改
     "type": "function",
     "function": {
         "name": "search_chunks",
@@ -300,7 +300,7 @@ _WEB_SEARCH_TOOL_SPEC = {
     },
 }
 
-_NAVIGATE_TREE_TOOL_SPEC = {
+_NAVIGATE_TREE_TOOL_SPEC = {##要修改
     "type": "function",
     "function": {
         "name": "navigate_tree",
