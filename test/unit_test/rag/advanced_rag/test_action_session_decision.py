@@ -32,6 +32,7 @@ def test_valid_single_envelope_binds_selected_call():
     assert c1["source"] == "llm_self_reported_tool_selection"
     assert c1["thought"] == "need semantic recall"
     assert c1["confidence"] == 0.8
+    assert c1["transport"] == "content_single"
     assert len(c1["candidates"]) == 2
     # the OTHER call in the batch is NOT fabricated — it stays unobserved
     assert result["c2"]["source"] == "parse_failed"
@@ -48,6 +49,8 @@ def test_per_call_decision_args_bind_every_call_in_batch():
     result = _parse_tool_decision_metadata("", calls)
     assert result["a"]["source"] == "llm_self_reported_tool_selection"
     assert result["b"]["source"] == "llm_self_reported_tool_selection"
+    assert result["a"]["transport"] == "args"
+    assert result["b"]["transport"] == "args"
     assert result["a"]["confidence"] == 0.7
     assert result["b"]["confidence"] == 1.0
 
@@ -65,6 +68,8 @@ def test_calls_array_binds_by_call_id():
     result = _parse_tool_decision_metadata(content, calls)
     assert result["c1"]["source"] == "llm_self_reported_tool_selection"
     assert result["c2"]["source"] == "llm_self_reported_tool_selection"
+    assert result["c1"]["transport"] == "content_calls"
+    assert result["c2"]["transport"] == "content_calls"
     assert result["c1"]["confidence"] == 0.7
     assert result["c2"]["confidence"] == 0.6
 
@@ -114,6 +119,7 @@ def test_empty_content_marks_provider_unsupported():
     assert result["c1"]["source"] == "provider_unsupported"
     assert result["c1"]["thought"] is None
     assert result["c1"]["confidence"] is None
+    assert result["c1"]["transport"] == "none"
 
 
 def test_validate_decision_entry_rejects_boolean_confidence():

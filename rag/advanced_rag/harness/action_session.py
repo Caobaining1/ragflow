@@ -1346,6 +1346,7 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
         if isinstance(decision, dict):
             parsed = _validate_decision_entry(decision, call_names)
             if parsed is not None and parsed.get("selected") == call.get("name"):
+                parsed["transport"] = "args"
                 result[call.get("id")] = parsed
 
     # 2) Assistant-text envelope(s).
@@ -1362,13 +1363,20 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
             if target is None:
                 target = next((c for c in calls if c.get("name") == parsed.get("selected") and c.get("id") not in result), None)
             if target is not None:
+                parsed["transport"] = "content_calls" if isinstance(data.get("calls"), list) else "content_single"
                 result[target.get("id")] = parsed
 
     # 3) Mark any call still unbound.
     source = "provider_unsupported" if not content else "parse_failed"
     for call in calls:
         if call.get("id") not in result:
-            result[call.get("id")] = {"thought": None, "confidence": None, "candidates": [], "source": source}
+            result[call.get("id")] = {
+                "thought": None,
+                "confidence": None,
+                "candidates": [],
+                "source": source,
+                "transport": "none",
+            }
     return result
 
 
@@ -1627,6 +1635,7 @@ async def _tool_node(state: _SessionState) -> dict:
                     confidence_source="llm_self_reported_tool_selection"
                     if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
                     else (c.get("decision") or {}).get("source", "parse_failed"),
+                    metadata_transport=(c.get("decision") or {}).get("transport", "none"),
                     tool_result={"status": REDUNDANT, "reason": "near_duplicate", "evidence_ids": []},
                 )
             continue
@@ -1662,6 +1671,7 @@ async def _tool_node(state: _SessionState) -> dict:
                     confidence_source="llm_self_reported_tool_selection"
                     if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
                     else (c.get("decision") or {}).get("source", "parse_failed"),
+                    metadata_transport=(c.get("decision") or {}).get("transport", "none"),
                     tool_result={"status": ERROR, "reason": "unknown_tool", "evidence_ids": []},
                 )
             continue
@@ -1719,6 +1729,7 @@ async def _tool_node(state: _SessionState) -> dict:
                 confidence_source="llm_self_reported_tool_selection"
                 if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
                 else (c.get("decision") or {}).get("source", "parse_failed"),
+                metadata_transport=(c.get("decision") or {}).get("transport", "none"),
                 tool_result={"status": status, "reason": reason or None, "evidence_ids": list(oc.evidence_ids)},
             )
         payload = json.dumps({"passages": chunks}, ensure_ascii=False, default=str)
