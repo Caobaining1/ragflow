@@ -1770,9 +1770,11 @@ async def _run_slot_research_pass(tools, question: str, state: AgenticState, ans
     sessions.
     """
     from rag.advanced_rag.harness.action_session import run_action_session
+
     trace = state.get("tool_trace")
     if trace is None:
         from rag.advanced_rag.harness.tool_trace import new_trace
+
         trace = new_trace(state.get("trace_id") or uuid.uuid4().hex)
     slot_table = state.get("slot_table")
     if slot_table is None:
