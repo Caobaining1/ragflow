@@ -516,7 +516,7 @@ class Base(ABC):
         return msg
 
     def _verbose_tool_use(self, name, args, res):
-        return "<tool_call>" + json.dumps({"name": name, "args": args, "result": res}, ensure_ascii=False, indent=2) + "</tool_call>"
+        return "<tool_call>" + json.dumps({"name": name, "args": args, "result": res}, ensure_ascii=False, indent=2, default=str) + "</tool_call>"
 
     def _append_history(self, hist, tool_call, tool_res):
         hist.append(
@@ -2490,6 +2490,7 @@ class LiteLLMBase(ABC):
                 {"name": name, "args": args, "result": str(res) if isinstance(res, Exception) else res},
                 ensure_ascii=False,
                 indent=2,
+                default=str,
             )
             + "</tool_call>"
         )
