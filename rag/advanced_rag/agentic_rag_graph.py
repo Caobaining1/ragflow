@@ -55,6 +55,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -72,13 +73,13 @@ _LOG = logging.getLogger(__name__)
 # one question's WHOLE pipeline comfortably under that line: when the budget
 # runs out the routing guards steer the graph straight to synthesis with
 # whatever evidence is on hand instead of starting another research round.
-_TOTAL_BUDGET_S = 180.0  # whole-graph wall-clock ceiling per question
-_MIN_ROUND_HEADROOM_S = 50.0  # need at least this much left to start a new round
-_PASS_TIMEOUT_S = 120.0  # slot research pass wall-clock
-_PREFETCH_TIMEOUT_S = 90.0  # programmatic fan-out fetch
-_DRAFT_TIMEOUT_S = 60.0  # fallback draft synthesis
-_SCA_TIMEOUT_S = 60.0  # sufficient-context review call
-_REWRITE_TIMEOUT_S = 45.0  # gap → query rewrite call
+_TOTAL_BUDGET_S = 360.0  # whole-graph wall-clock ceiling per question
+_MIN_ROUND_HEADROOM_S = 100.0  # need at least this much left to start a new round
+_PASS_TIMEOUT_S = 240.0  # slot research pass wall-clock
+_PREFETCH_TIMEOUT_S = 180.0  # programmatic fan-out fetch
+_DRAFT_TIMEOUT_S = 120.0  # fallback draft synthesis
+_SCA_TIMEOUT_S = 120.0  # sufficient-context review call
+_REWRITE_TIMEOUT_S = 90.0  # gap → query rewrite call
 
 
 def _snip(value: Any, limit: int = 240) -> str:
@@ -212,6 +213,8 @@ class AgenticState(TypedDict, total=False):
     max_loops: int
     deadline: float  # time.monotonic() stamp when research budget expires
     search_rounds: int  # completed SCA→query_rewrite iterations
+    trace_id: str
+    tool_trace: Any
     sca_view_id: str  # identity hash of the last SCA review view (unproductive-round detector)
     attempted: list  # [{"q": query, "r": round, "new": n_new}] — every issued search + outcome (rewriter context)
     fills_found: bool  # research-tree mode: at least one slot got a confident fill
@@ -897,6 +900,8 @@ def build_agentic_graph(
             "sca_view_id": "",
             "no_progress": False,
             "deadline": time.monotonic() + _TOTAL_BUDGET_S,
+            "trace_id": (trace_id := uuid.uuid4().hex),
+            "tool_trace": __import__("rag.advanced_rag.harness.tool_trace", fromlist=["new_trace"]).new_trace(trace_id),
         }
 
     # ── Node: planner (Phase 1) ──
@@ -1367,7 +1372,10 @@ async def _run_slot_research_pass(tools, question: str, state: AgenticState, ans
     sessions.
     """
     from rag.advanced_rag.harness.action_session import run_action_session
-
+    trace = state.get("tool_trace")
+    if trace is None:
+        from rag.advanced_rag.harness.tool_trace import new_trace
+        trace = new_trace(state.get("trace_id") or uuid.uuid4().hex)
     slot_table = state.get("slot_table")
     if slot_table is None:
         # No planner ran (medium single-pass, or planner failed): build the slot
@@ -1407,6 +1415,9 @@ async def _run_slot_research_pass(tools, question: str, state: AgenticState, ans
                 base_summary="",
                 shared_tool_cache=shared_tool_cache,
                 shared_search_queries=shared_search_queries,
+                trace=trace,
+                research_round=int(state.get("search_rounds", 0)) + 1,
+                slot_id=v.id,
             )
             return v.id, result
 

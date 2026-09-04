@@ -232,7 +232,7 @@ _LIST_CHUNKS_TOOL_SPEC = {
     },
 }
 
-_SEARCH_CHUNKS_TOOL_SPEC = {##要修改
+_SEARCH_CHUNKS_TOOL_SPEC = {
     "type": "function",
     "function": {
         "name": "search_chunks",
@@ -293,7 +293,7 @@ _WEB_SEARCH_TOOL_SPEC = {
     },
 }
 
-_NAVIGATE_TREE_TOOL_SPEC = {##要修改
+_NAVIGATE_TREE_TOOL_SPEC = {
     "type": "function",
     "function": {
         "name": "navigate_tree",
@@ -1137,6 +1137,44 @@ def _parse_tool_calls(msg) -> list:
     return calls
 
 
+def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
+    """Parse the model's auditable decision envelope.
+
+    Native tool calls remain executable when a provider drops assistant text,
+    but metadata is then explicitly marked unobserved. Candidate scores are
+    accepted only when they are numeric, in range, and sum to one.
+    """
+    data = extract_json(content or "") or {}
+    entries = data.get("calls") if isinstance(data, dict) and isinstance(data.get("calls"), list) else [data]
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        candidates = entry.get("candidates")
+        selected = entry.get("selected")
+        thought = entry.get("thought")
+        confidence = entry.get("confidence")
+        valid = isinstance(thought, str) and bool(thought.strip()) and isinstance(candidates, list)
+        normalized, total = [], 0.0
+        if valid:
+            for candidate in candidates:
+                score = candidate.get("score") if isinstance(candidate, dict) else None
+                name = candidate.get("name") if isinstance(candidate, dict) else None
+                if not isinstance(name, str) or not isinstance(score, (int, float)) or isinstance(score, bool) or not 0 <= float(score) <= 1:
+                    valid = False
+                    break
+                total += float(score)
+                normalized.append({"name": name, "selected": name == selected, "score": float(score), "score_source": "llm_self_reported_candidate_score", "score_observed": True})
+            valid = valid and bool(normalized) and abs(total - 1.0) <= 1e-6
+        valid = valid and isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= float(confidence) <= 1
+        if valid and isinstance(selected, str):
+            result[selected] = {"thought": thought.strip()[:1000], "confidence": float(confidence), "candidates": normalized, "source": "llm_self_reported_tool_selection"}
+    if not result:
+        source = "provider_unsupported" if not content else "parse_failed"
+        result = {call.get("name"): {"thought": None, "confidence": None, "candidates": [], "source": source} for call in calls}
+    return result
+
+
 def _parse_terminal(content: str, parent_state: State) -> tuple:
     """Parse the two DeepSearch terminal output blocks.
 
@@ -1199,6 +1237,11 @@ class _SessionState(TypedDict, total=False):
     _direction: str  # this slot's question — needed to re-run retrieval later
     _routed_docs: list  # navigate_tree's top-n: scope for the `scoped` rung
     _nav_rule_id: str  # which rung control currently rests on ("" = finished)
+    _trace: Any
+    _trace_round: int | None
+    _trace_slot_id: str | int | None
+    _search_queries: list
+    _skipped_dup: int
 
 
 async def _run_action_node(state: _SessionState) -> dict:
@@ -1223,6 +1266,9 @@ async def _run_action_node(state: _SessionState) -> dict:
 
     calls = _parse_tool_calls(msg)
     if calls:
+        decisions = _parse_tool_decision_metadata(content, calls)
+        for call in calls:
+            call["decision"] = decisions.get(call.get("name"), {"thought": None, "confidence": None, "candidates": [], "source": "parse_failed"})
         # pass the model's native tool_calls through verbatim so langgraph pairs
         # them with the tool responses; _pending_calls drives the tool node
         return {
@@ -1302,7 +1348,7 @@ async def _tool_node(state: _SessionState) -> dict:
     # tool_call that comes in — a call only advances its own rung, and a later
     # ladder continuation must continue from the SAME resting point.
     pending_rule = state.get("_nav_rule_id", "")
-    for c in pending:
+    for batch_index, c in enumerate(pending):
         # Near-duplicate retrieval suppression: if the model re-issues the same
         # intent as an earlier search (paraphrase), do NOT re-run ES — return a
         # nudge so it patches / reframes instead of burning turns (Q30 burned
@@ -1328,6 +1374,19 @@ async def _tool_node(state: _SessionState) -> dict:
                     ),
                 }
             )
+            if state.get("_trace") is not None:
+                await state["_trace"].record(
+                    action=c["name"], action_input=c.get("args") or {},
+                    session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                    slot_id=state.get("_trace_slot_id"),
+                    research_round=state.get("_trace_round"),
+                    thought=(c.get("decision") or {}).get("thought"),
+                    candidates=(c.get("decision") or {}).get("candidates") or [],
+                    metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
+                    confidence=(c.get("decision") or {}).get("confidence"),
+                    confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                    tool_result={"status": REDUNDANT, "reason": "near_duplicate", "evidence_ids": []},
+                )
             continue
         # Unknown tool name — never execute it; answer with a correction so the
         # model can recover. Models usually emit the XML protocol tags (state /
@@ -1346,6 +1405,19 @@ async def _tool_node(state: _SessionState) -> dict:
                     "content": json.dumps({"passages": [{"kind": "error", "note": hint}]}, ensure_ascii=False),
                 }
             )
+            if state.get("_trace") is not None:
+                await state["_trace"].record(
+                    action=c["name"], action_input=c.get("args") or {},
+                    session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                    slot_id=state.get("_trace_slot_id"),
+                    research_round=state.get("_trace_round"),
+                    thought=(c.get("decision") or {}).get("thought"),
+                    candidates=(c.get("decision") or {}).get("candidates") or [],
+                    metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
+                    confidence=(c.get("decision") or {}).get("confidence"),
+                    confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                    tool_result={"status": ERROR, "reason": "unknown_tool", "evidence_ids": []},
+                )
             continue
         # same-session tool cache: avoid re-grep/list_chunks on the same target
         cache_key = (c["name"], json.dumps(c["args"], sort_keys=True, ensure_ascii=False))
@@ -1386,6 +1458,19 @@ async def _tool_node(state: _SessionState) -> dict:
         # the prefix — so there is no model-driven navigate_structure rung here.)
         status, reason = oc.status, oc.reason
         outcomes.append({"name": c["name"], "status": status, "reason": reason, "metrics": oc.metrics})
+        if state.get("_trace") is not None:
+            await state["_trace"].record(
+                action=c["name"], action_input=c.get("args") or {},
+                session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                slot_id=state.get("_trace_slot_id"),
+                research_round=state.get("_trace_round"),
+                thought=(c.get("decision") or {}).get("thought"),
+                candidates=(c.get("decision") or {}).get("candidates") or [],
+                metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
+                confidence=(c.get("decision") or {}).get("confidence"),
+                confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                tool_result={"status": status, "reason": reason or None, "evidence_ids": list(oc.evidence_ids)},
+            )
         payload = json.dumps({"passages": chunks}, ensure_ascii=False, default=str)
         # if the session is already heavy, cut this payload proportionally
         if used + len(payload) > budget_chars:
@@ -1972,6 +2057,9 @@ async def run_action_session(
     base_summary: str = "",
     shared_tool_cache: dict | None = None,
     shared_search_queries: list | None = None,
+    trace=None,
+    research_round: int | None = None,
+    slot_id: str | int | None = None,
 ) -> Result:
     """Bounded graph-edge session pursuing ONE direction."""
     from rag.prompts.template import load_prompt
@@ -2042,6 +2130,9 @@ async def run_action_session(
         "_direction": direction,
         "_routed_docs": list(nav_ctx.known_docs),
         "_nav_rule_id": pending_rule,
+        "_trace": trace,
+        "_trace_round": research_round,
+        "_trace_slot_id": slot_id,
     }
     try:
         final = await _SESSION_GRAPH.ainvoke(initial)
