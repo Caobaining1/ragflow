@@ -1182,6 +1182,7 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
             continue
         candidates = entry.get("candidates")
         selected = entry.get("selected")
+        call_id = entry.get("call_id")
         thought = entry.get("thought")
         confidence = entry.get("confidence")
         valid = isinstance(thought, str) and bool(thought.strip()) and isinstance(candidates, list)
@@ -1205,6 +1206,33 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
         source = "provider_unsupported" if not content else "parse_failed"
         result = {call.get("name"): {"thought": None, "confidence": None, "candidates": [], "source": source} for call in calls}
     return result
+
+
+async def _recover_tool_decision_metadata(state: _SessionState, calls: list) -> dict:
+    """Recover metadata with a separate plain completion when a relay strips it.
+
+    This is an explicit second model response, not a locally inferred score.
+    """
+    names = [str(call.get("name") or "") for call in calls]
+    prompt = (
+        "The relay preserved the selected native tool call but stripped its decision metadata. "
+        "Return JSON only, no markdown: {\"thought\":\"short auditable reason\","
+        "\"confidence\":0.0,\"selected\":\"TOOL_NAME\","
+        "\"candidates\":[{\"name\":\"TOOL_NAME\",\"score\":0.0}]}. "
+        f"Already selected native call(s): {names}. Use only available tool names. "
+        "Scores must be numbers in [0,1] and sum exactly to 1. Do not call a tool."
+    )
+    try:
+        async with asyncio.timeout(max(10.0, min(30.0, state.get("deadline_left") or 30.0))):
+            response = await _acompletion(
+                state["mdl"], list(state["messages"]) + [HumanMessage(content=prompt)],
+                tools_list=None, temperature=0.0, timeout_s=30.0,
+            )
+        recovered_content = response.choices[0].message.content or ""
+        return _parse_tool_decision_metadata(recovered_content, calls)
+    except Exception:  # noqa: BLE001
+        _LOG.warning("[Action Session] decision metadata recovery failed", exc_info=True)
+        return {}
 
 
 def _parse_terminal(content: str, parent_state: State) -> tuple:
@@ -1299,6 +1327,10 @@ async def _run_action_node(state: _SessionState) -> dict:
     calls = _parse_tool_calls(msg)
     if calls:
         decisions = _parse_tool_decision_metadata(content, calls)
+        if not any(call.get("name") in decisions and decisions[call.get("name")].get("source") == "llm_self_reported_tool_selection" for call in calls):
+            recovered = await _recover_tool_decision_metadata(state, calls)
+            if recovered:
+                decisions = recovered
         for call in calls:
             call["decision"] = decisions.get(call.get("name"), {"thought": None, "confidence": None, "candidates": [], "source": "parse_failed"})
         # pass the model's native tool_calls through verbatim so langgraph pairs
