@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -466,7 +467,31 @@ def _active_tool_specs(tools) -> list:
     disabled = getattr(tools, "_disabled_tools", None) or set()
     if disabled:
         names -= set(disabled)
-    return [spec for name, spec in _TOOL_MAP.items() if name in names]
+    decision_schema = {
+        "type": "object",
+        "properties": {
+            "thought": {"type": "string", "minLength": 1},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "selected": {"type": "string"},
+            "candidates": {"type": "array", "minItems": 1, "items": {
+                "type": "object", "properties": {
+                    "name": {"type": "string"},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1}
+                }, "required": ["name", "score"]
+            }}
+        },
+        "required": ["thought", "confidence", "selected", "candidates"]
+    }
+    specs = []
+    for name, spec in _TOOL_MAP.items():
+        if name not in names:
+            continue
+        enriched = copy.deepcopy(spec)
+        props = enriched["function"]["parameters"].setdefault("properties", {})
+        props["decision"] = decision_schema
+        enriched["function"]["parameters"].setdefault("required", []).append("decision")
+        specs.append(enriched)
+    return specs
 
 
 def _disable_tool(tools, name: str) -> None:
@@ -1121,6 +1146,7 @@ def _parse_tool_calls(msg) -> list:
             args = {}
         if not isinstance(args, dict):
             args = {}
+        decision = args.pop("decision", None)
         if name not in _TOOL_MAP:
             # Do NOT drop it. OpenAI's protocol requires every assistant
             # tool_call to be answered by a matching ``tool`` message — dropping
@@ -1131,9 +1157,9 @@ def _parse_tool_calls(msg) -> list:
             # Models most often emit the XML protocol tags (state / answer) as
             # tool names; the hint below steers them back to plain-text output.
             _LOG.warning("[Action Session] tool_call to unknown tool %r; replying with a hint", name)
-            calls.append({"id": tc.id or f"call_{i}", "name": name, "args": args, "unknown": True})
+            calls.append({"id": tc.id or f"call_{i}", "name": name, "args": args, "decision_raw": decision, "unknown": True})
             continue
-        calls.append({"id": tc.id or f"call_{i}", "name": name, "args": args})
+        calls.append({"id": tc.id or f"call_{i}", "name": name, "args": args, "decision_raw": decision})
     return calls
 
 
@@ -1145,6 +1171,10 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
     accepted only when they are numeric, in range, and sum to one.
     """
     data = extract_json(content or "") or {}
+    # Preferred transport is a structured decision object inside native tool arguments.
+    raw = [c.get("decision_raw") for c in calls if isinstance(c.get("decision_raw"), dict)]
+    if raw:
+        data = raw[0]
     entries = data.get("calls") if isinstance(data, dict) and isinstance(data.get("calls"), list) else [data]
     result = {}
     for entry in entries:
@@ -2133,6 +2163,8 @@ async def run_action_session(
         "_trace": trace,
         "_trace_round": research_round,
         "_trace_slot_id": slot_id,
+        "_search_queries": shared_search_queries if shared_search_queries is not None else [],
+        "_skipped_dup": 0,
     }
     try:
         final = await _SESSION_GRAPH.ainvoke(initial)

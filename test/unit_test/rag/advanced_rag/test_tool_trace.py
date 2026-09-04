@@ -27,8 +27,9 @@ def test_trace_has_explicit_unknown_scores(tmp_path, monkeypatch):
     assert [first["tool_batch_index"], second["tool_batch_index"]] == [0, 1]
     assert first["confidence"] is None
     assert first["confidence_source"] == "not_provided"
-    assert first["candidates"][0]["score"] is None
-    assert all("0.5" not in line for line in path.read_text().splitlines())
+    assert first["candidates"] == []
+    assert first["candidate_score_observed"] is False
+    assert first["confidence_observed"] is False
     assert json.loads(path.read_text().splitlines()[0])["tool_result"]["evidence_ids"] == ["e1"]
 
 
