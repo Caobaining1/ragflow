@@ -1197,7 +1197,9 @@ def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
                 normalized.append({"name": name, "selected": name == selected, "score": float(score), "score_source": "llm_self_reported_candidate_score", "score_observed": True})
             valid = valid and bool(normalized) and abs(total - 1.0) <= 1e-6
         valid = valid and isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= float(confidence) <= 1
-        if valid and isinstance(selected, str):
+        call_names = {call.get("name") for call in calls}
+        candidate_names = {item["name"] for item in normalized}
+        if valid and isinstance(selected, str) and selected in call_names and candidate_names.issubset(_TOOL_MAP):
             result[selected] = {"thought": thought.strip()[:1000], "confidence": float(confidence), "candidates": normalized, "source": "llm_self_reported_tool_selection"}
     if not result:
         source = "provider_unsupported" if not content else "parse_failed"
