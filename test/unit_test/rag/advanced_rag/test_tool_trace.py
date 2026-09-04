@@ -11,13 +11,17 @@ def test_trace_has_explicit_unknown_scores(tmp_path, monkeypatch):
     async def run():
         trace = new_trace("request-1", research_round=2, slot_id=7)
         first = await trace.record(
-            action="search_chunks", action_input={"query": ["x"]},
-            session_turn=3, tool_batch_index=0,
+            action="search_chunks",
+            action_input={"query": ["x"]},
+            session_turn=3,
+            tool_batch_index=0,
             tool_result={"status": "ok", "reason": None, "evidence_ids": ["e1"]},
         )
         second = await trace.record(
-            action="retrieve", action_input={"query": ["y"]},
-            session_turn=3, tool_batch_index=1,
+            action="retrieve",
+            action_input={"query": ["y"]},
+            session_turn=3,
+            tool_batch_index=1,
         )
         return first, second
 
@@ -28,6 +32,7 @@ def test_trace_has_explicit_unknown_scores(tmp_path, monkeypatch):
     assert first["confidence"] is None
     assert first["confidence_source"] == "not_provided"
     assert first["candidates"] == []
+    assert first["metadata_transport"] == "not_provided"
     assert first["candidate_score_observed"] is False
     assert first["confidence_observed"] is False
     assert json.loads(path.read_text().splitlines()[0])["tool_result"]["evidence_ids"] == ["e1"]
@@ -39,8 +44,11 @@ def test_invalid_confidence_is_not_clamped(tmp_path, monkeypatch):
 
     async def run():
         return await new_trace("request-2").record(
-            action="retrieve", action_input={}, session_turn=1,
-            tool_batch_index=0, confidence=2.0,
+            action="retrieve",
+            action_input={},
+            session_turn=1,
+            tool_batch_index=0,
+            confidence=2.0,
         )
 
     event = asyncio.run(run())

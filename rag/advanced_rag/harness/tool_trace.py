@@ -4,6 +4,7 @@ Native provider tool calls do not expose calibrated tool probabilities.  This
 module therefore records only observed decision metadata and uses explicit
 null/source fields when it is unavailable.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,6 +41,7 @@ class ToolTrace:
         metadata_source: str = "not_provided",
         confidence: float | None = None,
         confidence_source: str = "not_provided",
+        metadata_transport: str = "not_provided",
     ) -> dict:
         if confidence is not None and not 0 <= confidence <= 1:
             confidence = None
@@ -70,11 +72,12 @@ class ToolTrace:
                 "candidate_score_observed": observed,
                 "score_semantics": "llm_self_reported_candidate_score",
                 "metadata_parse_source": metadata_source,
+                "metadata_transport": metadata_transport,
                 "tool_result": tool_result or {"status": None, "reason": None, "evidence_ids": []},
             }
             path = os.environ.get("RAGFLOW_TOOL_TRACE_PATH", "/ragflow/logs/tool_trace.jsonl")
             try:
-                with open(path, "a", encoding="utf-8") as stream:
+                with open(path, "a", encoding="utf-8") as stream:  # noqa: ASYNC230
                     stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
             except Exception:  # noqa: BLE001
                 _LOG.warning("[ToolTrace] failed to write tool decision trace", exc_info=True)
