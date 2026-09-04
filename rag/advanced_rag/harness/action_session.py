@@ -454,14 +454,13 @@ def _active_tool_specs(tools) -> list:
             "thought": {"type": "string", "minLength": 1},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "selected": {"type": "string"},
-            "candidates": {"type": "array", "minItems": 1, "items": {
-                "type": "object", "properties": {
-                    "name": {"type": "string"},
-                    "score": {"type": "number", "minimum": 0, "maximum": 1}
-                }, "required": ["name", "score"]
-            }}
+            "candidates": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "object", "properties": {"name": {"type": "string"}, "score": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["name", "score"]},
+            },
         },
-        "required": ["thought", "confidence", "selected", "candidates"]
+        "required": ["thought", "confidence", "selected", "candidates"],
     }
     specs = []
     for name, spec in _TOOL_MAP.items():
@@ -1208,6 +1207,8 @@ async def _acompletion(mdl, messages: list, tools_list=None, temperature: float 
         kwargs = {"model": mdl.model_name, "messages": oai_messages, "temperature": temperature}
         if tools_list:
             kwargs["tools"] = tools_list
+        if timeout_s:
+            kwargs["timeout"] = timeout_s
         response = await create(**kwargs)
         from rag.advanced_rag.harness.stats import record_external_response
 
@@ -1283,48 +1284,91 @@ def _parse_tool_calls(msg) -> list:
     return calls
 
 
-def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
-    """Parse the model's auditable decision envelope.
+def _validate_decision_entry(entry, call_names: set) -> dict | None:
+    """Validate ONE decision-envelope entry against the exposed tool surface.
 
-    Native tool calls remain executable when a provider drops assistant text,
-    but metadata is then explicitly marked unobserved. Candidate scores are
-    accepted only when they are numeric, in range, and sum to one.
+    Returns the normalized metadata dict (``source=llm_self_reported_tool_selection``)
+    plus ``selected``, or ``None`` when the entry is malformed: ``thought`` not a
+    non-empty string, ``confidence`` not numeric in [0,1], ``candidates`` not a
+    non-empty list whose names are known tools and whose scores are numeric in
+    [0,1] summing to 1.0 (within 1e-6), or ``selected`` not one of this batch's
+    native tool names.
     """
-    data = extract_json(content or "") or {}
-    # Preferred transport is a structured decision object inside native tool arguments.
-    raw = [c.get("decision_raw") for c in calls if isinstance(c.get("decision_raw"), dict)]
-    if raw:
-        data = raw[0]
-    entries = data.get("calls") if isinstance(data, dict) and isinstance(data.get("calls"), list) else [data]
+    if not isinstance(entry, dict):
+        return None
+    candidates = entry.get("candidates")
+    selected = entry.get("selected")
+    thought = entry.get("thought")
+    confidence = entry.get("confidence")
+    if not (isinstance(thought, str) and thought.strip() and isinstance(candidates, list)):
+        return None
+    normalized, total = [], 0.0
+    for candidate in candidates:
+        name = candidate.get("name") if isinstance(candidate, dict) else None
+        score = candidate.get("score") if isinstance(candidate, dict) else None
+        if not isinstance(name, str) or not isinstance(score, (int, float)) or isinstance(score, bool) or not 0 <= float(score) <= 1:
+            return None
+        total += float(score)
+        normalized.append({"name": name, "selected": name == selected, "score": float(score), "score_source": "llm_self_reported_candidate_score", "score_observed": True})
+    if not normalized or abs(total - 1.0) > 1e-6:
+        return None
+    if not (isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= float(confidence) <= 1):
+        return None
+    if not isinstance(selected, str) or selected not in call_names:
+        return None
+    if not {item["name"] for item in normalized}.issubset(_TOOL_MAP):
+        return None
+    return {"thought": thought.strip()[:1000], "confidence": float(confidence), "candidates": normalized, "source": "llm_self_reported_tool_selection", "selected": selected}
+
+
+def _parse_tool_decision_metadata(content: str, calls: list) -> dict:
+    """Bind per-call decision metadata to every native tool call in a batch.
+
+    Returns a dict keyed by call id (``tc.id`` or the synthesized ``call_N``), so
+    a multi-tool batch never collapses to a single entry and two same-named calls
+    never overwrite each other. Transport order (most reliable first):
+
+      1. each call's own ``decision`` object embedded in its tool arguments
+         (schema-required; survives relays that strip assistant text);
+      2. an assistant-text envelope — either a ``calls`` array bound by call_id,
+         or a single object bound by its ``selected`` name.
+
+    Calls left unbound are marked unobserved with a distinct source:
+    ``provider_unsupported`` (no assistant text at all — the relay dropped it)
+    or ``parse_failed`` (text present but no valid envelope covered the call).
+    """
+    call_names = {call.get("name") for call in calls}
     result = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        candidates = entry.get("candidates")
-        selected = entry.get("selected")
-        call_id = entry.get("call_id")
-        thought = entry.get("thought")
-        confidence = entry.get("confidence")
-        valid = isinstance(thought, str) and bool(thought.strip()) and isinstance(candidates, list)
-        normalized, total = [], 0.0
-        if valid:
-            for candidate in candidates:
-                score = candidate.get("score") if isinstance(candidate, dict) else None
-                name = candidate.get("name") if isinstance(candidate, dict) else None
-                if not isinstance(name, str) or not isinstance(score, (int, float)) or isinstance(score, bool) or not 0 <= float(score) <= 1:
-                    valid = False
-                    break
-                total += float(score)
-                normalized.append({"name": name, "selected": name == selected, "score": float(score), "score_source": "llm_self_reported_candidate_score", "score_observed": True})
-            valid = valid and bool(normalized) and abs(total - 1.0) <= 1e-6
-        valid = valid and isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= float(confidence) <= 1
-        call_names = {call.get("name") for call in calls}
-        candidate_names = {item["name"] for item in normalized}
-        if valid and isinstance(selected, str) and selected in call_names and candidate_names.issubset(_TOOL_MAP):
-            result[selected] = {"thought": thought.strip()[:1000], "confidence": float(confidence), "candidates": normalized, "source": "llm_self_reported_tool_selection"}
-    if not result:
-        source = "provider_unsupported" if not content else "parse_failed"
-        result = {call.get("name"): {"thought": None, "confidence": None, "candidates": [], "source": source} for call in calls}
+
+    # 1) Per-call decision object embedded in tool arguments.
+    for call in calls:
+        decision = call.get("decision_raw")
+        if isinstance(decision, dict):
+            parsed = _validate_decision_entry(decision, call_names)
+            if parsed is not None and parsed.get("selected") == call.get("name"):
+                result[call.get("id")] = parsed
+
+    # 2) Assistant-text envelope(s).
+    data = extract_json(content or "") or {}
+    if isinstance(data, dict) and data:
+        entries = data.get("calls") if isinstance(data.get("calls"), list) else [data]
+        for entry in entries:
+            parsed = _validate_decision_entry(entry, call_names)
+            if parsed is None:
+                continue
+            target = None
+            if isinstance(entry, dict) and entry.get("call_id"):
+                target = next((c for c in calls if c.get("id") == entry.get("call_id")), None)
+            if target is None:
+                target = next((c for c in calls if c.get("name") == parsed.get("selected") and c.get("id") not in result), None)
+            if target is not None:
+                result[target.get("id")] = parsed
+
+    # 3) Mark any call still unbound.
+    source = "provider_unsupported" if not content else "parse_failed"
+    for call in calls:
+        if call.get("id") not in result:
+            result[call.get("id")] = {"thought": None, "confidence": None, "candidates": [], "source": source}
     return result
 
 
@@ -1332,21 +1376,27 @@ async def _recover_tool_decision_metadata(state: _SessionState, calls: list) -> 
     """Recover metadata with a separate plain completion when a relay strips it.
 
     This is an explicit second model response, not a locally inferred score.
+    Bounded tightly (<=8s) so it never eats the action-session deadline on slow
+    models; on timeout it returns ``{}`` and the caller keeps the unobserved mark.
     """
     names = [str(call.get("name") or "") for call in calls]
     prompt = (
         "The relay preserved the selected native tool call but stripped its decision metadata. "
-        "Return JSON only, no markdown: {\"thought\":\"short auditable reason\","
-        "\"confidence\":0.0,\"selected\":\"TOOL_NAME\","
-        "\"candidates\":[{\"name\":\"TOOL_NAME\",\"score\":0.0}]}. "
+        'Return JSON only, no markdown: {"thought":"short auditable reason",'
+        '"confidence":0.0,"selected":"TOOL_NAME",'
+        '"candidates":[{"name":"TOOL_NAME","score":0.0}]}. '
         f"Already selected native call(s): {names}. Use only available tool names. "
         "Scores must be numbers in [0,1] and sum exactly to 1. Do not call a tool."
     )
+    wall = max(2.0, min(8.0, state.get("deadline_left") or 8.0))
     try:
-        async with asyncio.timeout(max(10.0, min(30.0, state.get("deadline_left") or 30.0))):
+        async with asyncio.timeout(wall):
             response = await _acompletion(
-                state["mdl"], list(state["messages"]) + [HumanMessage(content=prompt)],
-                tools_list=None, temperature=0.0, timeout_s=30.0,
+                state["mdl"],
+                list(state["messages"]) + [HumanMessage(content=prompt)],
+                tools_list=None,
+                temperature=0.0,
+                timeout_s=wall,
             )
         recovered_content = response.choices[0].message.content or ""
         return _parse_tool_decision_metadata(recovered_content, calls)
@@ -1447,12 +1497,16 @@ async def _run_action_node(state: _SessionState) -> dict:
     calls = _parse_tool_calls(msg)
     if calls:
         decisions = _parse_tool_decision_metadata(content, calls)
-        if not any(call.get("name") in decisions and decisions[call.get("name")].get("source") == "llm_self_reported_tool_selection" for call in calls):
+        # Only attempt metadata recovery when the relay stripped EVERYTHING
+        # (all calls unbound AND no assistant text). For parse_failed cases the
+        # model already returned text — a second completion is low-value and
+        # burns the session deadline on slow models.
+        if not content and all(decisions.get(call.get("id"), {}).get("source") != "llm_self_reported_tool_selection" for call in calls):
             recovered = await _recover_tool_decision_metadata(state, calls)
             if recovered:
                 decisions = recovered
         for call in calls:
-            call["decision"] = decisions.get(call.get("name"), {"thought": None, "confidence": None, "candidates": [], "source": "parse_failed"})
+            call["decision"] = decisions.get(call.get("id"), {"thought": None, "confidence": None, "candidates": [], "source": "parse_failed"})
         # pass the model's native tool_calls through verbatim so langgraph pairs
         # them with the tool responses; _pending_calls drives the tool node
         return {
@@ -1560,15 +1614,19 @@ async def _tool_node(state: _SessionState) -> dict:
             )
             if state.get("_trace") is not None:
                 await state["_trace"].record(
-                    action=c["name"], action_input=c.get("args") or {},
-                    session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                    action=c["name"],
+                    action_input=c.get("args") or {},
+                    session_turn=int(state.get("attempts", 0)),
+                    tool_batch_index=batch_index,
                     slot_id=state.get("_trace_slot_id"),
                     research_round=state.get("_trace_round"),
                     thought=(c.get("decision") or {}).get("thought"),
                     candidates=(c.get("decision") or {}).get("candidates") or [],
                     metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
                     confidence=(c.get("decision") or {}).get("confidence"),
-                    confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                    confidence_source="llm_self_reported_tool_selection"
+                    if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
+                    else (c.get("decision") or {}).get("source", "parse_failed"),
                     tool_result={"status": REDUNDANT, "reason": "near_duplicate", "evidence_ids": []},
                 )
             continue
@@ -1591,15 +1649,19 @@ async def _tool_node(state: _SessionState) -> dict:
             )
             if state.get("_trace") is not None:
                 await state["_trace"].record(
-                    action=c["name"], action_input=c.get("args") or {},
-                    session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                    action=c["name"],
+                    action_input=c.get("args") or {},
+                    session_turn=int(state.get("attempts", 0)),
+                    tool_batch_index=batch_index,
                     slot_id=state.get("_trace_slot_id"),
                     research_round=state.get("_trace_round"),
                     thought=(c.get("decision") or {}).get("thought"),
                     candidates=(c.get("decision") or {}).get("candidates") or [],
                     metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
                     confidence=(c.get("decision") or {}).get("confidence"),
-                    confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                    confidence_source="llm_self_reported_tool_selection"
+                    if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
+                    else (c.get("decision") or {}).get("source", "parse_failed"),
                     tool_result={"status": ERROR, "reason": "unknown_tool", "evidence_ids": []},
                 )
             continue
@@ -1644,15 +1706,19 @@ async def _tool_node(state: _SessionState) -> dict:
         outcomes.append({"name": c["name"], "status": status, "reason": reason, "metrics": oc.metrics})
         if state.get("_trace") is not None:
             await state["_trace"].record(
-                action=c["name"], action_input=c.get("args") or {},
-                session_turn=int(state.get("attempts", 0)), tool_batch_index=batch_index,
+                action=c["name"],
+                action_input=c.get("args") or {},
+                session_turn=int(state.get("attempts", 0)),
+                tool_batch_index=batch_index,
                 slot_id=state.get("_trace_slot_id"),
                 research_round=state.get("_trace_round"),
                 thought=(c.get("decision") or {}).get("thought"),
                 candidates=(c.get("decision") or {}).get("candidates") or [],
                 metadata_source=(c.get("decision") or {}).get("source", "parse_failed"),
                 confidence=(c.get("decision") or {}).get("confidence"),
-                confidence_source="llm_self_reported_tool_selection" if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection" else (c.get("decision") or {}).get("source", "parse_failed"),
+                confidence_source="llm_self_reported_tool_selection"
+                if (c.get("decision") or {}).get("source") == "llm_self_reported_tool_selection"
+                else (c.get("decision") or {}).get("source", "parse_failed"),
                 tool_result={"status": status, "reason": reason or None, "evidence_ids": list(oc.evidence_ids)},
             )
         payload = json.dumps({"passages": chunks}, ensure_ascii=False, default=str)
@@ -2317,8 +2383,6 @@ async def run_action_session(
         "_trace": trace,
         "_trace_round": research_round,
         "_trace_slot_id": slot_id,
-        "_search_queries": shared_search_queries if shared_search_queries is not None else [],
-        "_skipped_dup": 0,
     }
     try:
         final = await _SESSION_GRAPH.ainvoke(initial)
