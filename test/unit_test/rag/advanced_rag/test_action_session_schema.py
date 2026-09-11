@@ -14,6 +14,7 @@ PLAYBOOK_ANCHORS = ["WHEN TO CALL", "DO NOT CALL", "ARGUMENTS", "OUTPUT", "IF IT
 _EXECUTOR_SUPPORTED = {
     "retrieve": {"query", "doc_scope"},
     "search_chunks": {"query"},
+    "metadata_search": {"query", "filters", "logic"},
     "list_chunks": {"doc_id"},
     "navigate_tree": {"query", "keywords"},
     "navigate_structure": {"doc_id", "query", "kind"},
@@ -42,12 +43,12 @@ def test_tool_specs_have_playbook_sections():
 
 
 def test_active_tool_specs_tool_surface():
-    """Mode → exposed tool count: low=0, medium/high=7, ultra=8, web-hidden=6."""
+    """Mode → exposed tool count: low=0, medium/high=8, ultra=9, web-hidden=7."""
     assert len(_active_tool_specs(_mk_tools("low"))) == 0
-    assert len(_active_tool_specs(_mk_tools("medium"))) == 7
-    assert len(_active_tool_specs(_mk_tools("high"))) == 7
-    assert len(_active_tool_specs(_mk_tools("ultra"))) == 8
-    assert len(_active_tool_specs(_mk_tools("medium", web=False))) == 6
+    assert len(_active_tool_specs(_mk_tools("medium"))) == 8
+    assert len(_active_tool_specs(_mk_tools("high"))) == 8
+    assert len(_active_tool_specs(_mk_tools("ultra"))) == 9
+    assert len(_active_tool_specs(_mk_tools("medium", web=False))) == 7
 
 
 def test_schema_params_match_executor():
