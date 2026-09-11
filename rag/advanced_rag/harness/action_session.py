@@ -39,7 +39,7 @@ _LOG = logging.getLogger(__name__)
 _INIT_TIMEOUT_S = 45.0
 _ACTION_TIMEOUT_S = 75.0
 _SNIPPETS_PER_QUERY = 4
-_MAX_TOOL_RESPONSE_CHARS = 12000
+_MAX_TOOL_RESPONSE_CHARS = 100000
 # Dataset-level empty results (reason="no_structure") a compiled-structure tool
 # must accumulate before it is disabled for the rest of the session. Kept above
 # 1: a single empty can be SCOPED — graph_explore over a doc_scope that has no
@@ -770,7 +770,7 @@ def _admit_evidence(kbinfos, kb_seen, c, out, ids, seen, include_doc_id=True) ->
         return False
     seen.add(cid)
     ids.append(cid)
-    # Table chunks pass through UN-truncated: the 1200-char cap hides answer
+    # Table chunks pass through UN-truncated: the 5000-char cap hides answer
     # rows in the mid/late table (Q86: rank-19 row at char 5181 of a 8274-char
     # standings table was cut, so the session model guessed the athlete). The
     # pool (kbinfos) already stores the full chunk; only the model-facing
@@ -779,7 +779,7 @@ def _admit_evidence(kbinfos, kb_seen, c, out, ids, seen, include_doc_id=True) ->
     if _is_table_chunk(c):
         entry = {"id": str(cid), "content": _ct}
     else:
-        entry = {"id": str(cid), "content": _ct[:1200]}
+        entry = {"id": str(cid), "content": _ct[:5000]}
     if include_doc_id:
         entry["doc_id"] = _doc_id(c)
     out.append(entry)
@@ -1549,8 +1549,10 @@ def _validate_decision_entry(entry, call_names: set) -> dict | None:
     plus ``selected``, or ``None`` when the entry is malformed: ``thought`` not a
     non-empty string, ``confidence`` not numeric in [0,1], ``candidates`` not a
     non-empty list whose names are known tools and whose scores are numeric in
-    [0,1] summing to 1.0 (within 1e-6), or ``selected`` not one of this batch's
-    native tool names.
+    [0,1] with a positive total, or ``selected`` not one of this batch's native
+    tool names. Candidate scores are self-reported, not calibrated probabilities,
+    so they are rescaled to sum to 1.0 rather than rejected when the model's raw
+    total drifts (rounding, imperfect instruction following).
     """
     if not isinstance(entry, dict):
         return None
@@ -1568,8 +1570,14 @@ def _validate_decision_entry(entry, call_names: set) -> dict | None:
             return None
         total += float(score)
         normalized.append({"name": name, "selected": name == selected, "score": float(score), "score_source": "llm_self_reported_candidate_score", "score_observed": True})
-    if not normalized or abs(total - 1.0) > 1e-6:
+    if not normalized or total <= 0:
         return None
+    # Rescale to sum 1.0 instead of rejecting: the scores are self-reported
+    # metadata (see the action_run prompt), and a strict 1e-6 tolerance dropped
+    # otherwise-valid envelopes over harmless model rounding.
+    for item in normalized:
+        item["score"] = item["score"] / total
+        item["score_normalized"] = True
     if not (isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= float(confidence) <= 1):
         return None
     if not isinstance(selected, str) or selected not in call_names:

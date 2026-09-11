@@ -1657,6 +1657,25 @@ def build_agentic_graph(
     return g.compile()
 
 
+_NEGATIVE_CANDIDATES = {"0", "0.0", "zero", "none", "no", "null", "n/a", "na", "无", "没有", "沒有"}
+
+
+def _looks_like_negative_candidate(cand) -> bool:
+    """True when a slot candidate is a bare zero/negative (e.g. 0, none, no).
+
+    Such values are frequently produced from "no record was retrieved" rather
+    than from a positive source. The draft renderer flags them when they carry no
+    evidence_ids, so the SCA / finalize treat them as absence-based (unverified)
+    instead of as a positively-evidenced value.
+    """
+    s = str(cand or "").strip().lower()
+    if not s:
+        return False
+    if set(s) <= set("0."):  # bare zeros, e.g. "0", "0.0"
+        return True
+    return s in _NEGATIVE_CANDIDATES
+
+
 def _render_slot_draft(slot_table, collected_answer: str | None = None, slot_evidence: dict | None = None) -> str:
     """Render a slot table into a fact-preserving draft for the SCA.
 
@@ -1701,6 +1720,11 @@ def _render_slot_draft(slot_table, collected_answer: str | None = None, slot_evi
                 details.append(f"terminal={terminal}")
             if evidence_ids:
                 details.append(f"evidence_ids={evidence_ids}")
+            elif _looks_like_negative_candidate(cand):
+                # Absence-based: a bare 0/none that no retrieved passage supports.
+                # Flag it so the SCA / finalize treat it as unverified rather than a
+                # positively-evidenced value (guards "no record found ⇒ 0").
+                details.append("absence-based — unverified, no positive evidence_ids")
             suffix = " [" + ", ".join(details) + "]" if details else ""
             lines.append(f"- slot {vid} [{vtype}]: {cand} (strength={strength}){suffix}" + (f" — {tail}" if tail else ""))
         else:
