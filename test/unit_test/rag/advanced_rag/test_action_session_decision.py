@@ -93,9 +93,29 @@ def test_selected_not_in_batch_is_rejected():
     assert result["c1"]["source"] == "parse_failed"
 
 
-def test_score_sum_not_one_is_rejected():
+def test_score_sum_not_one_is_normalized():
+    """Self-reported scores are rescaled to 1.0 instead of dropped."""
     calls = [_call("c1", "search_chunks")]
     content = '{"thought":"x","confidence":0.9,"selected":"search_chunks","candidates":[{"name":"search_chunks","score":0.6},{"name":"retrieve","score":0.6}]}'
+    result = _parse_tool_decision_metadata(content, calls)
+    c1 = result["c1"]
+    assert c1["source"] == "llm_self_reported_tool_selection"
+    assert [c["score"] for c in c1["candidates"]] == [0.5, 0.5]
+
+
+def test_single_candidate_partial_score_is_normalized():
+    """A lone candidate below 1.0 (e.g. 0.7) is rescaled to 1.0, not rejected."""
+    calls = [_call("c1", "retrieve")]
+    content = '{"thought":"x","confidence":0.9,"selected":"retrieve","candidates":[{"name":"retrieve","score":0.7}]}'
+    result = _parse_tool_decision_metadata(content, calls)
+    assert result["c1"]["source"] == "llm_self_reported_tool_selection"
+    assert result["c1"]["candidates"][0]["score"] == 1.0
+
+
+def test_all_zero_scores_are_rejected():
+    """No positive total means there is nothing to normalize."""
+    calls = [_call("c1", "retrieve")]
+    content = '{"thought":"x","confidence":0.9,"selected":"retrieve","candidates":[{"name":"retrieve","score":0.0}]}'
     result = _parse_tool_decision_metadata(content, calls)
     assert result["c1"]["source"] == "parse_failed"
 

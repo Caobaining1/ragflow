@@ -64,11 +64,12 @@ def test_action_run_prompt_has_playbook():
     """action_run.md exposes the TOOL PLAYBOOK and only references real tools."""
     prompt = load_prompt("action_run")
     assert "TOOL PLAYBOOK" in prompt
-    for tool in ("navigate_structure", "calculate", "graph_explore"):
+    for tool in ("metadata_search", "navigate_structure", "calculate", "graph_explore"):
         assert tool in prompt
     for tool in (
         "retrieve",
         "search_chunks",
+        "metadata_search",
         "list_chunks",
         "navigate_tree",
         "navigate_structure",
@@ -77,3 +78,22 @@ def test_action_run_prompt_has_playbook():
         "graph_explore",
     ):
         assert tool in _TOOL_MAP
+
+
+def test_action_run_prompt_covers_metadata_search_statuses():
+    """The playbook tells the model how to react to metadata_search outcomes."""
+    prompt = load_prompt("action_run")
+    assert "metadata_search" in prompt
+    # ok / miss / poor handling for the one-shot pre-filter tool.
+    assert "ONCE per direction" in prompt
+    lowered = prompt.lower()
+    for status in ("`ok`", "`miss`", "`poor`"):
+        assert status in lowered
+
+
+def test_action_run_prompt_does_not_hardcode_tool_count():
+    """The tool surface lives in config._ALL_TOOLS — the prompt must not
+    advertise a stale count that drifts from the real surface."""
+    prompt = load_prompt("action_run")
+    for stale in ("7 tools", "8 tools", "those 7"):
+        assert stale not in prompt
