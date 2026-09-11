@@ -530,6 +530,118 @@ async def _expand_fanouts(tools, question: str, answer_conf: dict) -> list[str]:
         return [question] if question else []
 
 
+# Pre-search metadata channel: the LLM extracts the short NAMED ENTITIES each
+# sub-question targets, so the metadata (title) filter can pre-select the document
+# subset before retrieval. Entities use SPACES, never underscores.
+_METADATA_ENTITY_PROMPT = (
+    "For each numbered search sub-question below, extract up to 3 short named entities "
+    "it targets — the kind of name a document index stores as a title (an article/report "
+    "name, an organisation, a place, an event, a person). Use the exact surface form with "
+    "SPACES, never underscores. If a sub-question has no clear title-like entity, use an "
+    "empty string for it. Keep each entity under 10 words; never copy the whole "
+    "sub-question, never answer it. "
+    'Respond with JSON only: {"entities": [["<e1>", "<e2>", ...], ...]} — a list of '
+    "entity-arrays in the SAME ORDER as the sub-questions, JSON only, no prose."
+)
+
+# A usable metadata entity filter is a SHORT name — a long string is a copied
+# sub-question or an answer, which would make the title filter match nothing.
+_METADATA_ENTITY_MAX_WORDS = 10
+_METADATA_ENTITY_MAX_CHARS = 80
+_METADATA_MAX_ENTITIES = 3
+
+
+def _entity_looks_usable(entity: str) -> bool:
+    """Guard: the entity fed to the metadata title filter must be a short name."""
+    s = (entity or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if any(mark in low for mark in _FANOUT_ANSWER_MARKS):
+        return False
+    return not (len(s) > _METADATA_ENTITY_MAX_CHARS or len(s.split()) > _METADATA_ENTITY_MAX_WORDS)
+
+
+def _parse_fanout_entities(text: str, fanouts: list[str]) -> list[list[str]]:
+    """Extract up to 3 short entities per sub-question from a model reply.
+
+    Order-aligned with ``fanouts``; each element is a (deduped, guarded) entity
+    list. Accepts ``{"entities": [["e1","e2"], ...]}`` (preferred), a flat
+    ``{"entities": ["e1","e2",...]}`` (treated as one group for every sub-question),
+    or ``{"entities": [{"sub_question": ..., "entities": [...]}]}`` matched by text.
+    Entities failing :func:`_entity_looks_usable` are dropped.
+    """
+    out: list[list[str]] = [[] for _ in fanouts]
+    data = _extract_json_object(text)
+    if not isinstance(data, dict):
+        return out
+    items = data.get("entities")
+    if not isinstance(items, list) or not items:
+        return out
+    by_text: dict[str, list[str]] = {}
+    positional: list[list[str]] = []
+    for it in items:
+        if isinstance(it, dict):
+            ents = [str(e).strip() for e in (it.get("entities") or it.get("titles") or [])]
+            sq = str(it.get("sub_question") or it.get("fanout") or "").strip()
+            if sq:
+                by_text[sq] = ents
+            positional.append(ents)
+        elif isinstance(it, str):
+            positional.append([str(it).strip()])
+        elif isinstance(it, list):
+            positional.append([str(e).strip() for e in it])
+    for i, fq in enumerate(fanouts):
+        raw = by_text.get(fq, []) if by_text else (positional[i] if i < len(positional) else [])
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for e in raw:
+            e = (e or "").strip()
+            if e and e.lower() not in seen and _entity_looks_usable(e):
+                seen.add(e.lower())
+                cleaned.append(e)
+            if len(cleaned) >= _METADATA_MAX_ENTITIES:
+                break
+        out[i] = cleaned
+    return out
+
+
+async def _extract_fanout_entities(tools, fanouts: list[str], answer_conf: dict) -> dict[str, list[str]]:
+    """Map each sub-question to 1-3 short entities for metadata (title) filtering.
+
+    ONE chat call for the whole batch. Returns ``{fanout: [entities]}`` containing
+    only entries with at least one usable entity; any failure yields ``{}`` so the
+    metadata channel is simply skipped for this round — it never blocks pre-search.
+    """
+    queries = [str(f).strip() for f in (fanouts or []) if isinstance(f, str) and str(f).strip()]
+    if not queries:
+        return {}
+    try:
+        from rag.advanced_rag.harness.tools.search import _base_chat_mdl
+
+        mdl = _base_chat_mdl(tools)
+    except Exception:  # noqa: BLE001
+        _LOG.warning("[Prefetch] could not resolve base chat model for entity extraction", exc_info=True)
+        return {}
+    if mdl is None:
+        return {}
+    listed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(queries))
+    try:
+        ans, _ = await mdl.async_chat(
+            _METADATA_ENTITY_PROMPT,
+            [{"role": "user", "content": f"Sub-questions:\n{listed}"}],
+            dict(answer_conf or {}),
+        )
+        entities = _parse_fanout_entities(str(ans or ""), queries)
+    except Exception:  # noqa: BLE001
+        _LOG.warning("[Prefetch] entity extraction failed; skipping metadata channel", exc_info=True)
+        return {}
+    mapping = {q: es for q, es in zip(queries, entities) if es}
+    if mapping:
+        _LOG.info("[Prefetch] metadata entities: %s", mapping)
+    return mapping
+
+
 # Storage ceiling of the snippet pool across ALL rounds. Storage and REVIEW
 # are decoupled: the SCA only reads a ranked view (``_SCA_VIEW_CAP``), so the
 # pool may accumulate freely while prompts stay bounded. The former single
@@ -566,12 +678,12 @@ _DRILL_RESERVE = 12  # slots kept free after the FIRST prefetch so the research
 _SCA_VIEW_CAP = 60  # chunks shown to the Sufficient Context Agent per review (24 -> 60: 24 of 225 hid the answer-bearing table chunk from the SCA)
 
 
-async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: int | None = None) -> int:
+async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: int | None = None, answer_conf: dict | None = None, use_metadata: bool = False) -> int:
     """Programmatic fan-out retrieval: fetch all queries and fill ``kbinfos``.
 
     Phase 2 ("The RAG Agent searches ... all the query fanouts at once")
     for the SNIPPET pool the Sufficient Context Agent reviews (Phase 3 reads
-    actual retrieved text). Two collector channels run per query:
+    actual retrieved text). Up to three collector channels run per query:
 
     * Channel A (BM25 + ``narrow_by_terms``): exact-name recall, rewritten to a
       short match window.
@@ -579,6 +691,9 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
       text does NOT share surface words with the query. The 2026-08-27 hybrid
       experiment proved these blocks are valuable but are ALL filtered out by the keyword narrow step while
       crowding candidates out of top_n — so they now bypass it entirely.
+    * Channel C (metadata title pre-filter, only when ``use_metadata``): the LLM
+      distils each sub-question to a short title/entity, documents are pre-selected
+      by their ``title`` metadata, and hybrid retrieval runs INSIDE that subset.
 
     Called after planning and again after every Query-Rewriter pass. Returns
     how many NEW chunks were added; failures are swallowed per-query.
@@ -592,6 +707,7 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
             _query_to_terms,
             bm25_search,
             hybrid_search,
+            metadata_search,
         )
     except Exception:  # noqa: BLE001
         _LOG.warning("[rag_agent] could not import fan-out search helpers", exc_info=True)
@@ -637,7 +753,16 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
         _LOG.warning("[Prefetch] unexpected queries payload of type %s; skipping fan-out search", type(fanouts).__name__)
         return 0
 
-    async def _search_one(fq: str) -> tuple[list, list]:
+    # Channel C setup: one batched LLM call maps each sub-question to 1-3 short
+    # entities used to pre-filter documents by their ``title`` metadata (OR'ed).
+    # Best-effort: an empty mapping simply disables the channel for this round.
+    entities_by_query: dict[str, list[str]] = {}
+    if use_metadata:
+        entities_by_query = await _extract_fanout_entities(tools, fanouts, answer_conf or {})
+        if not entities_by_query:
+            _LOG.info("[Prefetch] no usable metadata entities; metadata channel disabled this round")
+
+    async def _search_one(fq: str) -> tuple[list, list, list]:
         # Each coroutine ONLY retrieves and returns chunk lists; it does NOT
         # touch ``kbinfos``. All mutation happens in the main coroutine below,
         # so concurrent fan-out searches cannot race on the shared list.
@@ -690,7 +815,34 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                     break
         except Exception:  # noqa: BLE001
             _LOG.warning("[rag_agent] hybrid channel failed for %r; skipping", fq, exc_info=True)
-        return kept_a, kept_b
+
+        # Channel C: metadata title pre-filter (only when usable entities were
+        # extracted for this sub-question). Documents are pre-selected by their
+        # ``title`` metadata matching ANY of the entities (OR), then hybrid
+        # retrieval runs INSIDE that subset; keep only hits A/B did not already
+        # surface (dedup happens again at merge).
+        kept_c: list = []
+        entities = entities_by_query.get(fq)
+        if entities:
+            seen_ab = seen_ids_a | {_chunk_id(c) for c in kept_b}
+            try:
+                mres = await metadata_search(
+                    tools,
+                    fq,
+                    [{"key": "title", "op": "contains", "value": e} for e in entities],
+                    logic="or",
+                    kb_ids=kb_ids,
+                    top_n=top_n,
+                )
+                for c in mres.get("chunks", []) or []:
+                    if _chunk_id(c) in seen_ab:
+                        continue
+                    kept_c.append(c)
+                    if len(kept_c) >= 4:  # modest metadata quota per query
+                        break
+            except Exception:  # noqa: BLE001
+                _LOG.warning("[rag_agent] metadata channel failed for %r (entities=%r); skipping", fq, entities, exc_info=True)
+        return kept_a, kept_b, kept_c
 
     async def _collect_evidence() -> list:
         """Channel 0: compiled evidence rows, folded into pool-shaped entries.
@@ -776,6 +928,11 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                 raw_added += 1
         return stop
 
+    def _channel(pair, idx: int) -> list:
+        if isinstance(pair, Exception) or not isinstance(pair, tuple):
+            return []
+        return pair[idx] if idx < len(pair) else []
+
     # Evidence rows first: they are answer material, so they must not be
     # crowded out by the chunk channels.
     if evidence_chunks:
@@ -800,18 +957,16 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                     return added
             except Exception:  # noqa: BLE001
                 _LOG.warning("[rag_agent] evidence top-up failed; continuing", exc_info=True)
-    # Channel A first (exact matches earn their slots), then semantic extras.
+    # Channel A first (exact matches earn their slots), then semantic extras,
+    # then the metadata (title) extras.
     for pair in results:
-        if isinstance(pair, Exception):
-            continue
-        kept_a, kept_b = pair if isinstance(pair, tuple) else ([], [])
-        if _admit(kept_a):
+        if _admit(_channel(pair, 0)):
             break
     for pair in results:
-        if isinstance(pair, Exception):
-            continue
-        _, kept_b = pair if isinstance(pair, tuple) else ([], [])
-        if _admit(kept_b):
+        if _admit(_channel(pair, 1)):
+            break
+    for pair in results:
+        if _admit(_channel(pair, 2)):
             break
 
     if room == 0:
@@ -1098,8 +1253,17 @@ def build_agentic_graph(
         tools.kbinfos = dict(getattr(tools, "kbinfos", None) or state.get("kbinfos") or {"chunks": [], "doc_aggs": []})
         t = min(_PREFETCH_TIMEOUT_S, max(10.0, _remaining_s(state) - _MIN_ROUND_HEADROOM_S))
         # First-round prefetch leaves drill slots free (see _DRILL_RESERVE).
+        # This is the pre-search stage right after fan-out: besides BM25 + hybrid,
+        # run the metadata (title) channel so sub-questions whose target document
+        # is identifiable by title reach it directly.
         added = await _bounded(
-            _fanout_search(tools, queries, capacity=_MAX_SNIPPET_POOL - _DRILL_RESERVE),
+            _fanout_search(
+                tools,
+                queries,
+                capacity=_MAX_SNIPPET_POOL - _DRILL_RESERVE,
+                answer_conf=answer_conf,
+                use_metadata=True,
+            ),
             t,
             "programmatic prefetch",
         )
