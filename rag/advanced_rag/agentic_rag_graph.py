@@ -673,6 +673,7 @@ _MAX_SLOT_DEPTH = 3
 # the research tree, not the gap-promotion rounds), so the depth test alone
 # cannot stop the table from growing one slot per round — this bound can.
 _MAX_SLOTS_TOTAL = 8
+_PRESEARCH_MAX_POOL = 18  # pre-search (first prefetch) hard ceiling on TOTAL chunks admitted
 _DRILL_RESERVE = 12  # slots kept free after the FIRST prefetch so the research
 #                       executor can top up evidence
 _SCA_VIEW_CAP = 60  # chunks shown to the Sufficient Context Agent per review (24 -> 60: 24 of 225 hid the answer-bearing table chunk from the SCA)
@@ -778,7 +779,7 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
         terms = _query_to_terms(fq)
         keyed = [t for t in terms if len(t) >= 3 and t.lower() not in _FANOUT_STOPWORDS and not t.isdigit() or (len(t) >= 4 and t.isdigit())]
         try:
-            res = await bm25_search(tools, fq, kb_ids=kb_ids, top_n=60, keywords=" ".join(keyed or terms))
+            res = await bm25_search(tools, fq, kb_ids=kb_ids, top_n=48, keywords=" ".join(keyed or terms))
             candidates = res.get("chunks", []) or []
         except Exception:  # noqa: BLE001
             _LOG.warning("[rag_agent] BM25 search failed for %r", fq, exc_info=True)
@@ -796,25 +797,28 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                     max_out_chars_per_chunk=1200,
                     max_out_total_chars=16000,
                 )
-                kept_a = (narrowed.get("kept", []) or [])[: max(1, top_n)]
+                kept_a = (narrowed.get("kept", []) or [])[: max(1, 5)]
             except Exception:  # noqa: BLE001
                 _LOG.warning("[rag_agent] narrowing failed for %r; using raw BM25 head", fq, exc_info=True)
                 kept_a = candidates[: max(1, top_n)]
 
-        # Channel B: semantic collector, narrow BYPASS. Keep only hits that
-        # Channel A did not already surface (dedup happens again at merge).
+        # Channel B: semantic collector (hybrid) — DISABLED in pre-search.
+        # No vector recall is issued; kept_b stays empty so Channel C dedup
+        # (seen_ab = seen_ids_a | kept_b) still works unchanged. Flip the
+        # `if False` guard to re-enable the hybrid recall.
         kept_b: list = []
         seen_ids_a = {_chunk_id(c) for c in kept_a}
-        try:
-            hres = await hybrid_search(tools, fq, kb_ids=kb_ids, top_n=30)
-            for c in hres.get("chunks", []) or []:
-                if _chunk_id(c) in seen_ids_a:
-                    continue
-                kept_b.append(c)
-                if len(kept_b) >= 4:  # modest semantic quota per query
-                    break
-        except Exception:  # noqa: BLE001
-            _LOG.warning("[rag_agent] hybrid channel failed for %r; skipping", fq, exc_info=True)
+        if False:  # pre-search hybrid channel disabled
+            try:
+                hres = await hybrid_search(tools, fq, kb_ids=kb_ids, top_n=30)
+                for c in hres.get("chunks", []) or []:
+                    if _chunk_id(c) in seen_ids_a:
+                        continue
+                    kept_b.append(c)
+                    if len(kept_b) >= 4:  # modest semantic quota per query
+                        break
+            except Exception:  # noqa: BLE001
+                _LOG.warning("[rag_agent] hybrid channel failed for %r; skipping", fq, exc_info=True)
 
         # Channel C: metadata title pre-filter (only when usable entities were
         # extracted for this sub-question). Documents are pre-selected by their
@@ -1260,7 +1264,7 @@ def build_agentic_graph(
             _fanout_search(
                 tools,
                 queries,
-                capacity=_MAX_SNIPPET_POOL - _DRILL_RESERVE,
+                capacity=_PRESEARCH_MAX_POOL,
                 answer_conf=answer_conf,
                 use_metadata=True,
             ),
