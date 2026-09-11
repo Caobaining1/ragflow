@@ -2611,6 +2611,32 @@ def _extract_relevant_evidence(tools, direction: str, max_chunks: int = 4) -> st
     return "\n".join(lines)
 
 
+def _dump_pool_evidence(tools) -> str:
+    """TEST-ONLY: full dump of the shared evidence pool for the session seed.
+
+    Counterpart to :func:`_extract_relevant_evidence`: no top-k cap and no
+    300-char truncation — every chunk currently in ``tools.kbinfos["chunks"]``
+    is injected verbatim so the action session sees ALL prior evidence.
+    """
+    from rag.advanced_rag.harness.tools.search import _chunk_id, _chunk_text
+
+    kbinfos = getattr(tools, "kbinfos", None) or {}
+    chunks = kbinfos.get("chunks") or []
+    lines = []
+    for c in chunks:
+        cid = _chunk_id(c)
+        text = (_chunk_text(c) or "").replace("\n", " ")
+        lines.append(f"[{cid}] {text}")
+    dump = "\n".join(lines)
+    _LOG.info(
+        "[Action Session] seed ALREADY RETRIEVED dump: %d chunk(s), %d chars (kbinfos pool=%d)",
+        len(lines),
+        len(dump),
+        len(chunks),
+    )
+    return dump
+
+
 async def run_action_session(
     tools,
     direction: str,
@@ -2629,7 +2655,11 @@ async def run_action_session(
     system = load_prompt("action_run")
     seed_user = f"Direction: {direction}\n\nState:\n{parent_state.render_slots()}"
 
-    existing = _extract_relevant_evidence(tools, direction, max_chunks=4)
+    # TEST: `_extract_relevant_evidence` (top-4 / 300-char relevance digest) is
+    # DISABLED. Instead inject the FULL shared evidence pool so the action session
+    # sees every passage already retrieved this round (and prior rounds).
+    # existing = _extract_relevant_evidence(tools, direction, max_chunks=4)
+    existing = _dump_pool_evidence(tools)
     if existing:
         seed_user += "\n\nALREADY RETRIEVED (do NOT re-retrieve these — use them to fill slots or identify gaps):\n" + existing
 
