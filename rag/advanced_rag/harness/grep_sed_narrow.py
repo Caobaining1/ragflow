@@ -37,7 +37,7 @@ _LOG = logging.getLogger(__name__)
 
 # Cost / safety caps.
 _MAX_GREP_TERMS = 16
-_MAX_CONTEXT = 2
+_MAX_CONTEXT = 6
 _DEFAULT_OUT_CHARS_PER_CHUNK = 1200
 _DEFAULT_OUT_TOTAL_CHARS = 16000
 # Head length kept per chunk when there is no match.

@@ -777,7 +777,14 @@ def _admit_evidence(kbinfos, kb_seen, c, out, ids, seen, include_doc_id=True) ->
     # session output was truncated here.
     _ct = _chunk_text(c) or ""
     if _is_table_chunk(c):
-        entry = {"id": str(cid), "content": _ct}
+        # Table chunks are shown to the model as a Markdown view (key-value for
+        # infoboxes, a full-row pipe table for ranked/result tables) instead of
+        # raw <table> markup: same rows, a fraction of the tokens, and the format
+        # comparison over 11 serializations ranks Markdown-KV/Markdown above raw
+        # HTML. The shared pool keeps the RAW chunk for citation and re-reads.
+        from rag.advanced_rag.harness.tools.table_view import table_view_or_raw
+
+        entry = {"id": str(cid), "content": table_view_or_raw(_ct)}
     else:
         entry = {"id": str(cid), "content": _ct[:5000]}
     if include_doc_id:
@@ -1188,7 +1195,7 @@ async def _exec_list_chunks(tools, doc_id: str) -> ToolOutcome:
     QUERY-level miss (``miss``), never a dataset fact, so ``_tool_node`` must not
     disable the tool over it.
     """
-    from rag.advanced_rag.harness.tools.search import _chunk_id, list_chunks
+    from rag.advanced_rag.harness.tools.search import _LIST_CHUNKS_MAX_CHUNKS, _chunk_id, _chunk_text, list_chunks
 
     try:
         res = await list_chunks(tools, doc_id)
@@ -1199,7 +1206,29 @@ async def _exec_list_chunks(tools, doc_id: str) -> ToolOutcome:
     kbinfos = _seed_evidence(tools)
     kb_seen = {_chunk_id(c) for c in kbinfos["chunks"] if isinstance(c, dict)}
     seen = set()
-    for c in (res.get("chunks") or [])[:30]:
+    doc_chunks = [c for c in (res.get("chunks") or []) if _chunk_id(c)]
+    # Section index (generic, not per-question): deep-reading a long document only
+    # helps if the model can see WHICH sections it holds. A 39-chunk article
+    # otherwise arrives as one undifferentiated wall of text and the answer-bearing
+    # section is what gets skipped (2026-09-16 FRAMES attribution: the right
+    # document was retrieved and read, the model still answered from the wrong
+    # section). The index lists every section heading + chunk id + size, so the
+    # model can target a section with a scoped search instead of re-reading all of
+    # it; it is metadata, not evidence, so it is not added to the citation pool.
+    index_lines = []
+    for i, c in enumerate(doc_chunks, 1):
+        txt = _chunk_text(c) or ""
+        head = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
+        index_lines.append(f"{i}. [{_chunk_id(c)}] {head[:120]} ({len(txt)} chars)")
+    if index_lines:
+        out.append(
+            {
+                "kind": "doc_index",
+                "doc_id": str(doc_id),
+                "content": "Sections of this document — read the ones the question needs:\n" + "\n".join(index_lines),
+            }
+        )
+    for c in doc_chunks[:_LIST_CHUNKS_MAX_CHUNKS]:
         cid = _chunk_id(c)
         if not cid:
             continue

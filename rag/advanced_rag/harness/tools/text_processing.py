@@ -353,7 +353,16 @@ def _narrow_content(content: str, kwds: list[str]) -> str | None:
     # table), and sentence-window narrowing truncates them to a header-only snippet.
     low_content = content.lower()
     if "<table" in low_content or "<tr" in low_content or "<td" in low_content:
-        return "..." + _highlight_keywords(content, kwds) + "..."
+        # Serialize the table to Markdown before the model sees it. The format
+        # comparison over 11 serializations ranks Markdown-KV first for field
+        # lookups (key: value beats header/position alignment) and Markdown
+        # tables as the cost/accuracy compromise; raw HTML is the expensive and
+        # least readable option. The row set is not pruned — rank/order and
+        # completeness decide table answers. Falls back to the raw text when
+        # nothing renders.
+        from rag.advanced_rag.harness.tools.table_view import table_view_or_raw
+
+        return "..." + _highlight_keywords(table_view_or_raw(content), kwds) + "..."
     pipe_rows = sum(1 for line in content.splitlines() if line.count("|") >= 2)
     if pipe_rows >= 3:
         return "..." + _highlight_keywords(content, kwds) + "..."

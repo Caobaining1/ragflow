@@ -674,6 +674,21 @@ _MAX_SLOT_DEPTH = 3
 # cannot stop the table from growing one slot per round — this bound can.
 _MAX_SLOTS_TOTAL = 8
 _PRESEARCH_MAX_POOL = 18  # pre-search (first prefetch) hard ceiling on TOTAL chunks admitted
+# Channel A (BM25 + narrow) keeps this many chunks per fan-out query. It is the
+# retrieval-window size, NOT the pool share: the pool is divided equally between
+# the channels that have chunks to offer, so A's quota no longer decides how much
+# of the pool it gets (measured 2026-09-16: 3 fan-outs x 5 = 15 chunks used to
+# take 15 of the 18 pre-search slots, starving the metadata channel).
+_CHANNEL_A_QUERY_QUOTA = 5
+# Channel B (semantic hybrid, narrow bypass) per-query quota. It was switched off
+# outright in pre-search by 2b2ae7a; re-enabled 2026-09-16. Two things changed
+# since: the pool share is now split EQUALLY between the channels that actually
+# have chunks, so a third channel no longer steals A's/C's slots, and the
+# zero-score attribution showed the surviving failures are passages whose surface
+# words do not overlap the query at all (a father's occupation, a section buried
+# in a long document) — exactly what only the semantic channel can reach.
+_PRESEARCH_HYBRID_ENABLED = True
+_CHANNEL_B_QUERY_QUOTA = 4
 _DRILL_RESERVE = 12  # slots kept free after the FIRST prefetch so the research
 #                       executor can top up evidence
 _SCA_VIEW_CAP = 60  # chunks shown to the Sufficient Context Agent per review (24 -> 60: 24 of 225 hid the answer-bearing table chunk from the SCA)
@@ -792,30 +807,32 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                     candidates,
                     keyed or terms,
                     fallback_terms=None,
-                    context={"before": 0, "after": 1},
+                    # Match-centred window: the answer-bearing row of a long
+                    # section is rarely its first line, and the old (0,1) window
+                    # showed the match plus one line only.
+                    context={"before": 2, "after": 4},
                     keywords=fq,
-                    max_out_chars_per_chunk=1200,
+                    max_out_chars_per_chunk=1500,
                     max_out_total_chars=16000,
                 )
-                kept_a = (narrowed.get("kept", []) or [])[: max(1, 5)]
+                kept_a = (narrowed.get("kept", []) or [])[: max(1, _CHANNEL_A_QUERY_QUOTA)]
             except Exception:  # noqa: BLE001
                 _LOG.warning("[rag_agent] narrowing failed for %r; using raw BM25 head", fq, exc_info=True)
-                kept_a = candidates[: max(1, top_n)]
+                kept_a = candidates[: max(1, _CHANNEL_A_QUERY_QUOTA)]
 
-        # Channel B: semantic collector (hybrid) — DISABLED in pre-search.
-        # No vector recall is issued; kept_b stays empty so Channel C dedup
-        # (seen_ab = seen_ids_a | kept_b) still works unchanged. Flip the
-        # `if False` guard to re-enable the hybrid recall.
+        # Channel B: semantic collector (hybrid, narrow bypass). Controlled by
+        # ``_PRESEARCH_HYBRID_ENABLED`` — when off, kept_b stays empty and
+        # Channel C's dedup (seen_ab = seen_ids_a | kept_b) still works unchanged.
         kept_b: list = []
         seen_ids_a = {_chunk_id(c) for c in kept_a}
-        if False:  # pre-search hybrid channel disabled
+        if _PRESEARCH_HYBRID_ENABLED:
             try:
                 hres = await hybrid_search(tools, fq, kb_ids=kb_ids, top_n=30)
                 for c in hres.get("chunks", []) or []:
                     if _chunk_id(c) in seen_ids_a:
                         continue
                     kept_b.append(c)
-                    if len(kept_b) >= 4:  # modest semantic quota per query
+                    if len(kept_b) >= _CHANNEL_B_QUERY_QUOTA:  # modest semantic quota per query
                         break
             except Exception:  # noqa: BLE001
                 _LOG.warning("[rag_agent] hybrid channel failed for %r; skipping", fq, exc_info=True)
@@ -937,11 +954,72 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
             return []
         return pair[idx] if idx < len(pair) else []
 
+    # ── Equal pool share for every channel that actually has chunks ────────
+    # Admitting the collectors strictly in order let channel A (up to
+    # ``_CHANNEL_A_QUERY_QUOTA`` chunks per fan-out query) consume the whole
+    # pre-search pool before the metadata channel was reached: measured
+    # 2026-09-16, 3 fan-outs -> A took 15 of the 18 slots and the metadata
+    # channel was truncated to 3 of the 8 chunks it offered; with 4 fan-outs it
+    # admitted nothing at all while its entity-extraction LLM call had already
+    # been paid for. Every channel that has something to offer now gets an equal
+    # share of the remaining room, so a claim-less dataset (FRAMES has no
+    # ``entity_type_kwd`` rows, so the evidence channel is inactive) with channel
+    # B disabled splits A/C 50/50 instead of A taking everything.
+    counts: dict = {"evidence": 0, "A": 0, "B": 0, "C": 0}
+    offered: dict = {name: sum(len(_channel(p, i)) for p in results) for i, name in ((0, "A"), (1, "B"), (2, "C"))}
+    active: list = (["evidence"] if evidence_chunks else []) + [n for n in ("A", "B", "C") if offered[n]]
+    share = max(1, -(-room // len(active))) if (active and room > 0) else 0
+    _LOG.info(
+        "[Prefetch] pool shares: room=%d active=%s share=%d (offered evidence=%d A=%d B=%d C=%d)",
+        room,
+        active or "-",
+        share,
+        len(evidence_chunks or []),
+        offered["A"],
+        offered["B"],
+        offered["C"],
+    )
+
+    def _log_admission() -> None:
+        _LOG.info(
+            "[Prefetch] admission by channel: evidence=%d A=%d B=%d C=%d (offered A=%d B=%d C=%d) total=%d room=%d",
+            counts["evidence"],
+            counts["A"],
+            counts["B"],
+            counts["C"],
+            offered["A"],
+            offered["B"],
+            offered["C"],
+            added,
+            room,
+        )
+
+    def _run_channel(name: str, idx: int, cap: int) -> bool:
+        # ``_admit`` consumes a whole per-query batch at once, so slice each
+        # batch to the channel's remaining share — otherwise one batch can
+        # overshoot the cap by up to (batch size - 1) and re-create the very
+        # imbalance the share is meant to remove.
+        before = added
+        stop = False
+        for pair in results:
+            remaining = cap - (added - before)
+            if remaining <= 0:
+                break
+            if _admit(_channel(pair, idx)[:remaining]):
+                stop = True
+                break
+        counts[name] += added - before
+        return stop
+
     # Evidence rows first: they are answer material, so they must not be
-    # crowded out by the chunk channels.
+    # crowded out by the chunk channels. Bounded by its equal share like the
+    # chunk channels are.
+    ev_before = added
     if evidence_chunks:
-        evidence_chunks = evidence_chunks[:_EVIDENCE_POOL_QUOTA]
+        evidence_chunks = evidence_chunks[: min(_EVIDENCE_POOL_QUOTA, share)]
         if _admit(evidence_chunks):
+            counts["evidence"] = added - ev_before
+            _log_admission()
             return added
         # Directional top-up (external gathering): an evidence row carries a
         # verbatim quote but not its surrounding passage, so pull exactly the
@@ -957,21 +1035,24 @@ async def _fanout_search(tools, fanouts: list[str], top_n: int = 8, capacity: in
                 from rag.advanced_rag.harness.tools.navigation import _load_chunks_for_ids
 
                 fetched = await _load_chunks_for_ids(tools, wanted[:_EVIDENCE_TOP_UP])
-                if fetched and _admit(fetched):
+                room_for_evidence = max(0, share - (added - ev_before))
+                if fetched and _admit(fetched[:room_for_evidence]):
+                    counts["evidence"] = added - ev_before
+                    _log_admission()
                     return added
             except Exception:  # noqa: BLE001
                 _LOG.warning("[rag_agent] evidence top-up failed; continuing", exc_info=True)
-    # Channel A first (exact matches earn their slots), then semantic extras,
-    # then the metadata (title) extras.
-    for pair in results:
-        if _admit(_channel(pair, 0)):
-            break
-    for pair in results:
-        if _admit(_channel(pair, 1)):
-            break
-    for pair in results:
-        if _admit(_channel(pair, 2)):
-            break
+    counts["evidence"] = added - ev_before
+    # Channel order still decides who is served first in the only remaining
+    # unequal case: the ceil() rounding of ``share`` can make the shares sum to
+    # slightly more than ``room``, and the global room guard then trims whichever
+    # channel is served last. Each channel is otherwise capped at exactly its
+    # own share, so the pool split stays even and a channel with nothing to offer
+    # costs nobody else a slot.
+    _run_channel("A", 0, share)
+    _run_channel("B", 1, share)
+    _run_channel("C", 2, share)
+    _log_admission()
 
     if room == 0:
         _LOG.info("[Prefetch] snippet pool FULL (%d chunks); nothing new admitted", max_total)
@@ -1021,8 +1102,53 @@ async def _compose_answer_from_evidence(state: AgenticState, tools, token_queue:
     )
     from rag.advanced_rag.agentic_rag import _EVIDENCE_BUDGET_TOKENS
 
-    _CITE_CHUNK_CAP = 6
-    cite_chunks = ranked[:_CITE_CHUNK_CAP] or all_chunks
+    _CITE_CHUNK_CAP = 12
+    # The answer model's evidence pool is assembled from three prioritised
+    # groups, deduped by chunk id, then trimmed to the cap (``kb_prompt`` still
+    # enforces the token budget on top of this):
+    #   1. slot-cited chunks — the passages that actually produced each slot's
+    #      draft/candidate (``state["slot_evidence"]``). This is evidence the
+    #      research already committed to, so it belongs in the pool by default
+    #      instead of being re-selected by similarity from scratch.
+    #   2. table chunks — aggregation answers ("how many times / how many
+    #      children / which year") are tallied from rows, so the table has to
+    #      reach the answer model; a pure top-k-by-similarity slice dropped the
+    #      deciding election-result table (FRAMES Q673/Q483).
+    #   3. top-similarity chunks — fallback citation reference.
+    # The previous pool was a hard top-6-by-similarity: too few once several
+    # slots each cite distinct evidence, and it starved groups 1 and 2.
+    from rag.advanced_rag.harness.tools.search import _chunk_id, _is_table_chunk
+
+    by_chunk_id: dict[str, dict] = {}
+    for _c in all_chunks:
+        _cid = _chunk_id(_c)
+        if _cid and _cid not in by_chunk_id:
+            by_chunk_id[_cid] = _c
+    _slot_evidence = state.get("slot_evidence") or {}
+    _slot_order: list[str] = []
+    for _meta in _slot_evidence.values():
+        for _eid in (_meta.get("evidence_ids") or []):
+            _eid = str(_eid)
+            if _eid not in _slot_order:
+                _slot_order.append(_eid)
+    slot_cite = [by_chunk_id[eid] for eid in _slot_order if eid in by_chunk_id]
+    _TABLE_CITE_CAP = 4
+    table_cite = [c for c in ranked if _is_table_chunk(c)][:_TABLE_CITE_CAP]
+
+    cite_chunks: list = []
+    _seen_cite: set[str] = set()
+    for _group in (slot_cite, table_cite, ranked):
+        for _c in _group:
+            _key = _chunk_id(_c) or str(id(_c))
+            if _key in _seen_cite:
+                continue
+            _seen_cite.add(_key)
+            cite_chunks.append(_c)
+            if len(cite_chunks) >= _CITE_CHUNK_CAP:
+                break
+        if len(cite_chunks) >= _CITE_CHUNK_CAP:
+            break
+    cite_chunks = cite_chunks or all_chunks
     # DESIGN ENHANCEMENT (Go parity: RunResponse.SlotCitations): expose the
     # slot evidence ids and the citation-pool chunk ids so the rag tool's
     # post-processing can rewrite unresolvable [ID:Slot N] markers into real
@@ -1260,6 +1386,9 @@ def build_agentic_graph(
         # This is the pre-search stage right after fan-out: besides BM25 + hybrid,
         # run the metadata (title) channel so sub-questions whose target document
         # is identifiable by title reach it directly.
+        # The ceiling stays fixed; fairness between the channels is enforced
+        # inside _fanout_search by sharing the pool equally (see "pool shares"
+        # there), instead of letting channel A's per-query quota eat it all.
         added = await _bounded(
             _fanout_search(
                 tools,

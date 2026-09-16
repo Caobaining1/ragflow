@@ -161,7 +161,17 @@ def _kb_block(ck, index: int, hash_id: bool = False) -> str | None:
     for k, v in meta.items():
         cnt += draw_node(k, v)
     cnt += "\n└── Content:\n"
-    cnt += content
+    # Tables must reach the answer model as a Markdown view, not raw <table>
+    # markup. The action session already renders tables for the research loop,
+    # but the final evidence pool is assembled here through ``kb_prompt`` and
+    # previously bypassed the renderer: a retrieved election/standings table
+    # arrived as HTML the model could not parse and it answered "cannot be
+    # determined" (FRAMES Q673 "Politics of California"). ``table_view_or_raw``
+    # is a no-op for chunks that hold no table, so non-table evidence is
+    # unaffected. Imported lazily to avoid a tools->prompts import cycle.
+    from rag.advanced_rag.harness.tools.table_view import table_view_or_raw
+
+    cnt += table_view_or_raw(content)
     return cnt
 
 

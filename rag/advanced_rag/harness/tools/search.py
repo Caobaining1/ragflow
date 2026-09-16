@@ -421,8 +421,12 @@ async def structured_query(tools, query: str, keywords: str = "", kb_ids: list[s
 # ─── do exact keyword/pattern locate + full-document deep-read like dynamic. ───
 
 _GREP_TERMS_MAX = 10
-_GREP_OUT_CHARS_PER_CHUNK = 700
-_GREP_OUT_TOTAL_CHARS = 8000
+# Per-chunk window for a grep hit. 700 chars was measured to hide mid-section
+# answer rows (a rank row at 62% of a 14.7K-char table, a "her father was an ice
+# hockey player" clause in an Early-life section); the window is now centred on
+# the matched line (see the narrow call below) and doubled.
+_GREP_OUT_CHARS_PER_CHUNK = 1500
+_GREP_OUT_TOTAL_CHARS = 12000
 _LIST_CHUNKS_MAX_CHUNKS = 80
 
 
@@ -511,7 +515,10 @@ async def grep_search(
                 prose_chunks,
                 terms,
                 keywords=str(query).strip(),
-                context={"before": 1, "after": 0},
+                # Centre the window on the matched line instead of showing the
+                # match alone: the fact that answers the question usually sits
+                # one or two lines around the grep hit, not on it.
+                context={"before": 2, "after": 3},
                 max_out_chars_per_chunk=_GREP_OUT_CHARS_PER_CHUNK,
                 max_out_total_chars=_GREP_OUT_TOTAL_CHARS,
             )
