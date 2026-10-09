@@ -29,32 +29,20 @@ import (
 	"ragflow/internal/common"
 )
 
-// metadataResolver is the agentic_rag package's view of the document-metadata
+// MetadataResolver is the agentic_rag package's view of the document-metadata
 // service. It is declared here — not imported from internal/service — because
 // service imports agentic_rag, so importing it back would form an import cycle.
-// The service layer wires the concrete *service.MetadataService through
-// SetMetadataService before an agent turn; the tool reads it via
-// getMetadataService.
+// The service layer passes the concrete *service.MetadataService on each turn's
+// Input, and the tool instance holds it, so concurrent turns never share state.
 //
 // The method set mirrors internal/service.MetadataService exactly so the concrete
 // type satisfies this interface structurally (no adapter needed).
-type metadataResolver interface {
+type MetadataResolver interface {
 	FilterDocIDsByMetaPushdown(ctx context.Context, kbIDs []string, filters []map[string]any, logic string) ([]string, bool)
 	GetFlattedMetaByKBs(ctx context.Context, kbIDs []string) (common.MetaData, error)
 	MetadataForDocIDs(ctx context.Context, kbIDs, docIDs []string) (map[string]map[string]any, error)
 	DeclaredMetadataFields(ctx context.Context, kbIDs []string) ([]common.MetadataFieldDef, error)
 }
-
-// metadataResolverSvc is the wired metadata resolver, or nil when the deployment
-// has not wired one (the tool then reports "unavailable").
-var metadataResolverSvc metadataResolver
-
-// SetMetadataService wires the document-metadata resolver used by the
-// search_metadata tool. Called by the service layer (which owns the concrete
-// *service.MetadataService) before an agent run; pass nil to clear it.
-func SetMetadataService(s metadataResolver) { metadataResolverSvc = s }
-
-func getMetadataService() metadataResolver { return metadataResolverSvc }
 
 const metadataSearchToolName = "search_metadata"
 
@@ -87,12 +75,15 @@ type metadataSearchArgs struct {
 type MetadataSearchTool struct {
 	tenantID   string
 	datasetIDs []string
+	resolver   MetadataResolver
 }
 
-// NewMetadataSearchTool returns a MetadataSearchTool scoped to the given tenant
-// and datasets, implementing eino's runtime.InvokableTool.
-func NewMetadataSearchTool(tenantID string, datasetIDs []string) *MetadataSearchTool {
-	return &MetadataSearchTool{tenantID: tenantID, datasetIDs: datasetIDs}
+// NewMetadataSearchTool returns a MetadataSearchTool scoped to the given tenant,
+// datasets, and document-metadata resolver, implementing eino's
+// runtime.InvokableTool. The resolver is bound to the instance — not a package
+// variable — so concurrent turns cannot race on shared state.
+func NewMetadataSearchTool(tenantID string, datasetIDs []string, resolver MetadataResolver) *MetadataSearchTool {
+	return &MetadataSearchTool{tenantID: tenantID, datasetIDs: datasetIDs, resolver: resolver}
 }
 
 // Info returns the tool's metadata for the chat model.
@@ -155,7 +146,7 @@ func (m *MetadataSearchTool) invokableRun(ctx context.Context, argumentsInJSON s
 		return metadataSearchResult([]string{}, nil,
 			"No metadata conditions given. search_metadata needs at least one {key, op, value} filter; otherwise use search_chunks / grep_chunks to locate by content.")
 	}
-	svc := getMetadataService()
+	svc := m.resolver
 	if svc == nil {
 		return metadataSearchResult([]string{}, nil,
 			"search_metadata is unavailable in this deployment (no metadata resolver is wired). Use search_chunks / grep_chunks / list_chunks.")
@@ -168,7 +159,7 @@ func (m *MetadataSearchTool) invokableRun(ctx context.Context, argumentsInJSON s
 		return metadataSearchResult([]string{}, nil,
 			"search_metadata needs a dataset scope; none is bound to this conversation.")
 	}
-	known := metadataKnownFields(ctx, svc, kbIDs)
+	known, observed := metadataKnownFields(ctx, svc, kbIDs, filters)
 	var bad []string
 	for _, f := range filters {
 		if key, _ := f["key"].(string); !known[key] {
@@ -185,10 +176,17 @@ func (m *MetadataSearchTool) invokableRun(ctx context.Context, argumentsInJSON s
 	}
 	docIDs, ok := svc.FilterDocIDsByMetaPushdown(ctx, kbIDs, filters, logic)
 	if !ok {
-		metas, ferr := svc.GetFlattedMetaByKBs(ctx, kbIDs)
-		if ferr != nil || metas == nil {
-			return metadataSearchResult([]string{}, nil,
-				"The document-metadata index could not be read (infrastructure failure — NOT a statement about the dataset). Fall back to search_chunks / grep_chunks / list_chunks.")
+		// The push-down is not viable, so filter in memory. Reuse the observed
+		// fields already read for key validation when present; otherwise read
+		// them now — this is the one path that genuinely needs the flattened index.
+		metas := observed
+		if metas == nil {
+			var ferr error
+			metas, ferr = svc.GetFlattedMetaByKBs(ctx, kbIDs)
+			if ferr != nil || metas == nil {
+				return metadataSearchResult([]string{}, nil,
+					"The document-metadata index could not be read (infrastructure failure — NOT a statement about the dataset). Fall back to search_chunks / grep_chunks / list_chunks.")
+			}
 		}
 		docIDs = common.MetaFilter(metas, &common.MetaFilterInput{
 			Conditions: metadataConditions(filters),
@@ -266,9 +264,13 @@ func metadataConditions(filters []map[string]any) []common.MetaCondition {
 	return out
 }
 
-// metadataKnownFields merges the dataset's declared and observed metadata fields
-// into the set the tool will accept as a valid filter key.
-func metadataKnownFields(ctx context.Context, svc metadataResolver, kbIDs []string) map[string]bool {
+// metadataKnownFields resolves the set of accepted filter keys, starting from
+// the dataset's declared fields — a cheap one-row-per-dataset read. The
+// expensive observed-fields read (GetFlattedMetaByKBs, up to 10k records across
+// the requested datasets) runs only when a requested key is not covered by the
+// declarations. The observed set, when read, is returned so the push-down
+// fallback can reuse it instead of reading it a second time.
+func metadataKnownFields(ctx context.Context, svc MetadataResolver, kbIDs []string, filters []map[string]any) (map[string]bool, common.MetaData) {
 	known := map[string]bool{}
 	if declared, err := svc.DeclaredMetadataFields(ctx, kbIDs); err == nil {
 		for _, d := range declared {
@@ -277,12 +279,24 @@ func metadataKnownFields(ctx context.Context, svc metadataResolver, kbIDs []stri
 			}
 		}
 	}
-	if metas, err := svc.GetFlattedMetaByKBs(ctx, kbIDs); err == nil {
-		for k := range metas {
-			known[k] = true
+	needObserved := false
+	for _, f := range filters {
+		if key, _ := f["key"].(string); !known[key] {
+			needObserved = true
+			break
 		}
 	}
-	return known
+	if !needObserved {
+		return known, nil
+	}
+	metas, err := svc.GetFlattedMetaByKBs(ctx, kbIDs)
+	if err != nil {
+		return known, nil
+	}
+	for k := range metas {
+		known[k] = true
+	}
+	return known, metas
 }
 
 func metadataAvailableKeys(known map[string]bool) string {
@@ -306,7 +320,7 @@ func metadataAvailableKeys(known map[string]bool) string {
 // order, capped at metadataContextDocsMax. A nil perDoc (the read failed or the
 // resolver answered nothing) yields nil — the ids alone are still a complete
 // result.
-func metadataContextDocs(ctx context.Context, svc metadataResolver, kbIDs, docIDs []string, known map[string]bool) []map[string]any {
+func metadataContextDocs(ctx context.Context, svc MetadataResolver, kbIDs, docIDs []string, known map[string]bool) []map[string]any {
 	perDoc, err := svc.MetadataForDocIDs(ctx, kbIDs, docIDs)
 	if err != nil || len(perDoc) == 0 {
 		return nil

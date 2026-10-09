@@ -59,9 +59,9 @@ type configFile struct {
 }
 
 // toolFactory builds a tool.BaseTool scoped to the given tenant/datasets. The
-// retrieval tools need tenantID/datasetIDs; the reasoning/sandbox tools ignore
-// them.
-type toolFactory func(tenantID string, datasetIDs []string) tool.BaseTool
+// retrieval tools need tenantID/datasetIDs; search_metadata additionally binds
+// the run's document-metadata resolver; the reasoning/sandbox tools ignore both.
+type toolFactory func(tenantID string, datasetIDs []string, resolver MetadataResolver) tool.BaseTool
 
 // toolRegistry maps every supported tool name to its constructor. Keeping this
 // here means adding a new tool is a one-line registration, and the config drives
@@ -70,17 +70,17 @@ type toolFactory func(tenantID string, datasetIDs []string) tool.BaseTool
 // has a search provider.
 func toolRegistry() map[string]toolFactory {
 	return map[string]toolFactory{
-		"think":              func(_ string, _ []string) tool.BaseTool { return NewThinkTool() },
-		"todo_write":         func(_ string, _ []string) tool.BaseTool { return NewTodoWriteTool() },
-		"run_javascript":     func(_ string, _ []string) tool.BaseTool { return NewRunJavascriptTool() },
-		"grep_chunks":        func(t string, d []string) tool.BaseTool { return NewGrepChunksTool(t, d) },
-		"search_chunks":      func(t string, d []string) tool.BaseTool { return NewSearchChunksTool(t, d) },
-		"search_bm25_chunks": func(t string, d []string) tool.BaseTool { return NewSearchBm25ChunksTool(t, d) },
+		"think":              func(_ string, _ []string, _ MetadataResolver) tool.BaseTool { return NewThinkTool() },
+		"todo_write":         func(_ string, _ []string, _ MetadataResolver) tool.BaseTool { return NewTodoWriteTool() },
+		"run_javascript":     func(_ string, _ []string, _ MetadataResolver) tool.BaseTool { return NewRunJavascriptTool() },
+		"grep_chunks":        func(t string, d []string, _ MetadataResolver) tool.BaseTool { return NewGrepChunksTool(t, d) },
+		"search_chunks":      func(t string, d []string, _ MetadataResolver) tool.BaseTool { return NewSearchChunksTool(t, d) },
+		"search_bm25_chunks": func(t string, d []string, _ MetadataResolver) tool.BaseTool { return NewSearchBm25ChunksTool(t, d) },
 		// The pure-vector leg: same payload as search_chunks, no keyword leg at
 		// all (see tool_search_semantic_chunks.go).
-		"search_semantic_chunks": func(t string, d []string) tool.BaseTool { return NewSearchSemanticChunksTool(t, d) },
-		"list_chunks":            func(t string, d []string) tool.BaseTool { return NewListChunksTool(t, d) },
-		"search_metadata":        func(t string, d []string) tool.BaseTool { return NewMetadataSearchTool(t, d) },
+		"search_semantic_chunks": func(t string, d []string, _ MetadataResolver) tool.BaseTool { return NewSearchSemanticChunksTool(t, d) },
+		"list_chunks":            func(t string, d []string, _ MetadataResolver) tool.BaseTool { return NewListChunksTool(t, d) },
+		"search_metadata":        func(t string, d []string, md MetadataResolver) tool.BaseTool { return NewMetadataSearchTool(t, d, md) },
 	}
 }
 
@@ -206,7 +206,7 @@ func instructionFor(t Template) string {
 // toolsFor builds the agent tool set from the template's tool list, falling back
 // to the full default set when the template lists none. Unknown names are
 // skipped with a warning so a typo doesn't silently drop a tool.
-func toolsFor(t Template, tenantID string, datasetIDs []string) []tool.BaseTool {
+func toolsFor(t Template, tenantID string, datasetIDs []string, resolver MetadataResolver) []tool.BaseTool {
 	reg := toolRegistry()
 	names := t.Tools
 	if len(names) == 0 {
@@ -223,7 +223,7 @@ func toolsFor(t Template, tenantID string, datasetIDs []string) []tool.BaseTool 
 				zap.String("tool", name))
 			continue
 		}
-		out = append(out, f(tenantID, datasetIDs))
+		out = append(out, f(tenantID, datasetIDs, resolver))
 	}
 	return out
 }

@@ -24,14 +24,15 @@ import (
 	"ragflow/internal/common"
 )
 
-// fakeMetadataService is a metadataResolver implementation with no external
+// fakeMetadataService is a MetadataResolver implementation with no external
 // dependencies, driving the search_metadata tool through every branch.
 type fakeMetadataService struct {
-	fields     []common.MetadataFieldDef
-	metas      common.MetaData
-	pushdown   []string
-	pushdownOK bool
-	docMeta    map[string]map[string]any
+	fields       []common.MetadataFieldDef
+	metas        common.MetaData
+	pushdown     []string
+	pushdownOK   bool
+	docMeta      map[string]map[string]any
+	flattedCalls int
 }
 
 func (f *fakeMetadataService) FilterDocIDsByMetaPushdown(_ context.Context, _ []string, _ []map[string]any, _ string) ([]string, bool) {
@@ -39,6 +40,7 @@ func (f *fakeMetadataService) FilterDocIDsByMetaPushdown(_ context.Context, _ []
 }
 
 func (f *fakeMetadataService) GetFlattedMetaByKBs(_ context.Context, _ []string) (common.MetaData, error) {
+	f.flattedCalls++
 	return f.metas, nil
 }
 
@@ -63,11 +65,9 @@ type msResult struct {
 // runMetadataSearch wires the given resolver and runs the tool, failing the test
 // on a transport-level error (the tool converts its own failures to a model
 // result, so InvokableRun should only error on malformed input).
-func runMetadataSearch(t *testing.T, svc metadataResolver, args string) msResult {
+func runMetadataSearch(t *testing.T, svc MetadataResolver, args string) msResult {
 	t.Helper()
-	SetMetadataService(svc)
-	defer SetMetadataService(nil)
-	out, err := NewMetadataSearchTool("t", []string{"kb1"}).InvokableRun(context.Background(), args)
+	out, err := NewMetadataSearchTool("t", []string{"kb1"}, svc).InvokableRun(context.Background(), args)
 	if err != nil {
 		t.Fatalf("InvokableRun returned error: %v", err)
 	}
@@ -79,7 +79,7 @@ func runMetadataSearch(t *testing.T, svc metadataResolver, args string) msResult
 }
 
 func TestMetadataSearchTool_InfoParsesSchema(t *testing.T) {
-	if _, err := NewMetadataSearchTool("t", nil).Info(context.Background()); err != nil {
+	if _, err := NewMetadataSearchTool("t", nil, nil).Info(context.Background()); err != nil {
 		t.Fatalf("Info schema failed to parse: %v", err)
 	}
 }
@@ -156,5 +156,57 @@ func TestMetadataSearchTool_ContextDocs(t *testing.T) {
 	}
 	if got, ok := r.Documents[0].Metadata["author"]; !ok || got != "Zhang San" {
 		t.Fatalf("want author=Zhang San in metadata, got %+v", r.Documents[0].Metadata)
+	}
+}
+
+// TestMetadataSearchTool_DefersFlattedReadWhenKeyDeclared pins the performance
+// contract: a filter key covered by the declared fields must not trigger the
+// (up to 10k-record) flattened-metadata read.
+func TestMetadataSearchTool_DefersFlattedReadWhenKeyDeclared(t *testing.T) {
+	svc := &fakeMetadataService{
+		fields:     []common.MetadataFieldDef{{Key: "author", Type: "string"}},
+		pushdown:   []string{"doc1"},
+		pushdownOK: true,
+	}
+	r := runMetadataSearch(t, svc, `{"filters":[{"key":"author","op":"contains","value":"Zhang"}]}`)
+	if len(r.DocIDs) != 1 || r.DocIDs[0] != "doc1" {
+		t.Fatalf("want [doc1], got %v", r.DocIDs)
+	}
+	if svc.flattedCalls != 0 {
+		t.Fatalf("flattened metadata read must be deferred when the key is declared, got %d call(s)", svc.flattedCalls)
+	}
+}
+
+// TestMetadataSearchTool_ReadsFlattedForUndeclaredKey pins the fallback: a key
+// absent from the declarations must consult the observed fields, exactly once.
+func TestMetadataSearchTool_ReadsFlattedForUndeclaredKey(t *testing.T) {
+	svc := &fakeMetadataService{
+		metas:      common.MetaData{"year": {"2024": []string{"doc1"}}},
+		pushdown:   []string{"doc1"},
+		pushdownOK: true,
+	}
+	r := runMetadataSearch(t, svc, `{"filters":[{"key":"year","op":"contains","value":"2024"}]}`)
+	if len(r.DocIDs) != 1 || r.DocIDs[0] != "doc1" {
+		t.Fatalf("want [doc1], got %v", r.DocIDs)
+	}
+	if svc.flattedCalls != 1 {
+		t.Fatalf("want exactly one flattened read for an undeclared key, got %d", svc.flattedCalls)
+	}
+}
+
+// TestMetadataSearchTool_ReusesFlattedReadForFallback pins that the in-memory
+// fallback reuses the observed fields already read for key validation instead
+// of reading them a second time.
+func TestMetadataSearchTool_ReusesFlattedReadForFallback(t *testing.T) {
+	svc := &fakeMetadataService{
+		metas: common.MetaData{"year": {"2024": []string{"doc1"}}},
+		// pushdownOK=false → the in-memory fallback runs.
+	}
+	r := runMetadataSearch(t, svc, `{"filters":[{"key":"year","op":"contains","value":"2024"}]}`)
+	if len(r.DocIDs) != 1 || r.DocIDs[0] != "doc1" {
+		t.Fatalf("fallback failed, want [doc1], got %v", r.DocIDs)
+	}
+	if svc.flattedCalls != 1 {
+		t.Fatalf("fallback must reuse the already-read observed fields, want 1 call, got %d", svc.flattedCalls)
 	}
 }

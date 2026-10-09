@@ -193,7 +193,7 @@ func TestWebSearchRidesOnTheContext(t *testing.T) {
 // list stays a description of the corpus toolset alone.
 func TestToolsFor_WebSearchIsRuntimeInjected(t *testing.T) {
 	tools := toolsFor(Template{ID: "t", Tools: []string{"think", webSearchToolName}},
-		"tenant", nil)
+		"tenant", nil, nil)
 	if len(tools) != 1 {
 		t.Fatalf("tools = %d, want only think (web_search is injected by Run)", len(tools))
 	}

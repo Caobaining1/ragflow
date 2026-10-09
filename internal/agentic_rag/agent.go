@@ -70,6 +70,11 @@ type Input struct {
 	// DatasetIDs is the conversation's bound dataset scope, decided by the
 	// session created in the UI. It is injected into the retrieval tools.
 	DatasetIDs []string
+	// MetadataResolver, when non-nil, is the document-metadata resolver the
+	// search_metadata tool binds to for this turn. It travels per-run — never
+	// through a package variable — so concurrent turns cannot race; nil hides the
+	// tool's data source and the tool reports itself unavailable.
+	MetadataResolver MetadataResolver
 	// Tools are the eino tools the agent may call. When empty, the tool set of
 	// the resolved template (TemplateID, else the config's default) is used.
 	// The web_search tool is NOT passed here: it is injected from the run's
@@ -311,7 +316,7 @@ func Run(ctx context.Context, in Input) (string, error) {
 		// lets operators change the tool list without recompiling. The config
 		// is reloaded from disk when its mtime changes, so a quick edit +
 		// re-run is enough to try a different tool subset or prompt variant.
-		tools = toolsFor(tmpl, in.TenantID, in.DatasetIDs)
+		tools = toolsFor(tmpl, in.TenantID, in.DatasetIDs, in.MetadataResolver)
 		// Web search is injected, never declared: the template's tool list
 		// describes the corpus toolset, and a conversation whose context
 		// carries a provider gets one extra tool at run time.
