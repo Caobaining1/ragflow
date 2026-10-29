@@ -50,6 +50,9 @@ export async function runChatCompletionStream({
   // `startsWith` / think-marker behaviour depends on the raw accumulated text
   // rather than on the rendered message content.
   let accumulatedAnswer = '';
+  // The plan is state, not a delta: a chunk that carries it must not lose it on
+  // the next flush, so the newest snapshot is re-attached to every write.
+  let latestTodo: CompletionChunk['todo'];
   let aborted = false;
   let ok = true;
 
@@ -65,6 +68,7 @@ export async function runChatCompletionStream({
     if (!pendingChunk) return;
     applyAnswer(conversationId, {
       ...pendingChunk,
+      ...(latestTodo ? { todo: latestTodo } : {}),
       answer: accumulatedAnswer,
       conversationId,
     });
@@ -94,11 +98,20 @@ export async function runChatCompletionStream({
     try {
       for await (const chunk of parseCompletionEventStream(response)) {
         accumulatedAnswer = mergeAnswerChunk(accumulatedAnswer, chunk);
+        if (chunk.todo) {
+          latestTodo = chunk.todo;
+        }
         pendingChunk = pendingChunk ? { ...pendingChunk, ...chunk } : chunk;
 
         // The first chunk flushes immediately (lastFlushAt is 0), so the empty
-        // placeholder is replaced without waiting out an interval.
-        if (chunk.final || Date.now() - lastFlushAt >= AnswerFlushIntervalMs) {
+        // placeholder is replaced without waiting out an interval. A plan
+        // update flushes immediately too: it is the only chunk in the window
+        // that carries visible state rather than text.
+        if (
+          chunk.final ||
+          chunk.todo ||
+          Date.now() - lastFlushAt >= AnswerFlushIntervalMs
+        ) {
           flushAnswer();
         }
       }

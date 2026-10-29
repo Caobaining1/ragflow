@@ -34,6 +34,7 @@ import { UploadedMessageFiles } from '../next-message-item/uploaded-message-file
 import { RAGFlowAvatar } from '../ragflow-avatar';
 import SvgIcon from '../svg-icon';
 import { useTheme } from '../theme-provider';
+import TodoPlan from '../todo-plan';
 import { AssistantGroupButton, UserGroupButton } from './group-button';
 import styles from './index.module.less';
 import { TurnUsage } from './turn-usage';
@@ -152,6 +153,11 @@ const MessageItem = ({
                 sendLoading={sendLoading}
                 deleteDisabled={deleteDisabled}
               ></UserGroupButton>
+            )}
+            {/* The agentic plan, while (and after) the run works through it.
+                Only the owning turn shows it: a later turn starts a new list. */}
+            {isAssistant && item.todo && item.todo.todos.length > 0 && (
+              <TodoPlan todo={item.todo} />
             )}
             {/* Show message content if there's any text besides the download */}
             {(messageContent || sendLoading) && (

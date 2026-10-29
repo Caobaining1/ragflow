@@ -100,6 +100,9 @@ type AsyncChatResult struct {
 	// the think-block sentence), forwarded so a client can render steps —
 	// tool, status, counts, sources, duration — instead of paragraphs.
 	ThinkEvent *ThinkEvent `json:"think_event,omitempty"`
+	// Todo is the agentic run's whole todo list, emitted whenever the
+	// todo_write tool replaces it. It is turn-scoped UI state, not answer text.
+	Todo *agentic_rag.TodoState `json:"todo,omitempty"`
 	// Usage and ElapsedMs are this turn's cost, emitted on the final chunk so a
 	// client can show what the answer cost. They are the same numbers the
 	// Langfuse generation below records; without them a UI has to parse the

@@ -200,6 +200,8 @@ export interface IAnswer {
   /** Present on the final chunk only; absent for answers restored from history. */
   usage?: ITurnUsage;
   elapsed_ms?: number;
+  /** The agentic run's plan, sent whenever todo_write replaces it. */
+  todo?: ITodoState;
 }
 
 export interface Docagg {
@@ -251,11 +253,37 @@ export interface IExternalChatInfo {
   llm_id?: string;
 }
 
+/** Status of one item in an agentic run's todo list. */
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+/** One item of the agentic run's todo list. */
+export interface ITodoItem {
+  content: string;
+  status: TodoStatus;
+}
+
+/** Per-status tally shipped beside the list. */
+export interface ITodoCounts {
+  pending: number;
+  in_progress: number;
+  completed: number;
+}
+
+/**
+ * The agentic run's whole todo list after a write, plus its counts. Each
+ * snapshot is complete: the latest one replaces the previous.
+ */
+export interface ITodoState {
+  todos: ITodoItem[];
+  counts: ITodoCounts;
+}
+
 export interface IMessage extends Message {
   id: string;
   awaitingServerId?: boolean;
   reference?: IReference; // the latest news has reference
   conversationId?: string; // To distinguish which conversation the message belongs to
+  todo?: ITodoState; // the agentic plan attached to this turn, live during the stream
 }
 
 export interface IClientConversation extends IConversation {

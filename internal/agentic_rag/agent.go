@@ -102,6 +102,10 @@ type Input struct {
 	// OnDelta, when non-nil, receives each incremental (content, reasoning)
 	// delta as it streams. When nil, deltas fall back to runtime.EmitAgentMessage.
 	OnDelta func(contentDelta, thinkingDelta string)
+	// OnTodo, when non-nil, receives every whole-list snapshot the todo_write
+	// tool writes during this run, so a caller can render the plan as it
+	// changes instead of waiting for the final answer.
+	OnTodo func(TodoState)
 	// ToolCallCounts, when non-nil, is filled with the number of times each tool
 	// was invoked during this agent turn, keyed by tool name. Tools never called
 	// are omitted. Useful for per-question usage accounting.
@@ -347,6 +351,9 @@ func Run(ctx context.Context, in Input) (string, error) {
 	// the corpus-level existence probe, and the claims already shown. Installed
 	// here so the pre-loop probe and every locate tool share one scope.
 	ctx = withCompiledRun(ctx, in.TenantID, in.DatasetIDs)
+	// The turn's todo plan: every todo_write replaces this whole list, and each
+	// replacement is reported to the caller for live rendering.
+	ctx = withTodoPlan(ctx, in.OnTodo)
 
 	// Identity the judge is chosen for: the decision model is configured per chat
 	// and per tenant in the UI, so the filter has to know which run it is

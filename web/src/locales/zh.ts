@@ -1081,6 +1081,8 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       maxTokensInvalidMessage: '请输入有效的最大令牌数。',
       maxTokensMinMessage: '最大令牌数不能小于 0。',
       thinking: '思考中...',
+      todoTitle: '任务计划',
+      todoProgress: '已完成 {{done}}/{{total}}',
       thinkingMode: '思考',
       thought: '思考完成',
       thinkingDefault: '系统默认',

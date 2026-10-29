@@ -19,54 +19,35 @@ package agentic_rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
 
-// todoWriteToolName echoes back the current task list. It is stateless: it does
-// not persist state, so the model maintains its plan within the conversation
-// context.
 const todoWriteToolName = "todo_write"
 
-const todoWriteToolDescription = `Use this tool to create and manage a structured task list for retrieval and research tasks. This helps you track progress and organize complex retrieval operations.
-
-**CRITICAL - Focus on Retrieval Tasks Only**:
-- This tool is for tracking RETRIEVAL and RESEARCH tasks (e.g., searching datasets, retrieving documents, gathering information)
-- DO NOT include summary or synthesis tasks in todo_write - those are handled by the think tool
-- Examples of appropriate tasks: "Search for X in dataset", "Retrieve information about Y", "Compare A and B"
-- Examples of tasks to EXCLUDE: "Summarize findings", "Generate final answer", "Synthesize results" - these are for the think tool
-
-## When to Use This Tool
-Use this tool proactively when a task requires 3 or more distinct retrieval steps, needs careful planning, or when the user provides multiple tasks.
-
-## When NOT to Use This Tool
-Skip for single, straightforward, or purely conversational tasks.
-
-## Task States and Management
-- pending: not started
-- in_progress: currently working on (limit to ONE at a time)
-- completed: finished successfully
-
-Mark tasks complete immediately after finishing. Only mark completed when fully accomplished.
-The todo_write tool tracks WHAT to retrieve; the think tool handles HOW to synthesize and present the information.`
+// todoWriteToolDescription is the model-facing contract. It states the three
+// rules the tool enforces: whole-list replacement, one active task, and
+// retrieval-only scope.
+const todoWriteToolDescription = `Record and update a structured task list for the current work. Call it once at the START of any question that needs more than one retrieval step, BEFORE the first search, with the concrete steps you intend. Send the ENTIRE list every call - it REPLACES the previous list (there are no partial updates, no per-item edits). Keep AT MOST ONE todo in_progress at a time; while work remains, exactly one active task should be in_progress. Mark a todo completed the moment it is done (do not batch completions), and leave no in_progress item only once all work is complete. Track RETRIEVAL and RESEARCH steps only - summarising findings and writing the answer belong to the think tool, not here. Skip the list for trivial single-step or purely conversational tasks. Statuses: pending (not started), in_progress (being worked on now), completed (finished).`
 
 // todoWriteArgs is the JSON the model sends into InvokableRun.
 type todoWriteArgs struct {
-	Task  string     `json:"task,omitempty"`
-	Steps []planStep `json:"steps"`
+	Todos []todoWriteItem `json:"todos"`
 }
 
-// planStep is a single step in the retrieval plan.
-type planStep struct {
-	ID          string `json:"id"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
+// todoWriteItem is one model-supplied entry, kept unvalidated until
+// canonicalTodos has checked the whole list.
+type todoWriteItem struct {
+	Content string `json:"content"`
+	Status  string `json:"status"`
 }
 
-// TodoWriteTool is a stateless retrieval-planning tool.
+// TodoWriteTool replaces the run's whole todo list. It keeps no state of its
+// own: the list lives in the run context (see todo_plan.go), which is what lets
+// a client render the plan while the agent is still working.
 type TodoWriteTool struct{}
 
 // NewTodoWriteTool returns a TodoWriteTool implementing eino's tool.InvokableTool.
@@ -80,30 +61,23 @@ func (t *TodoWriteTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 		Name: todoWriteToolName,
 		Desc: todoWriteToolDescription,
 		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-			"task": {
-				Type: schema.String,
-				Desc: "The complex task or question you need to create a plan for.",
-			},
-			"steps": {
-				Type: schema.Array,
-				Desc: "Array of plan steps, each with id, description, and status (pending|in_progress|completed).",
+			"todos": {
+				Type:     schema.Array,
+				Desc:     "The COMPLETE task list, replacing any previous list.",
+				Required: true,
 				ElemInfo: &schema.ParameterInfo{
 					Type: schema.Object,
 					SubParams: map[string]*schema.ParameterInfo{
-						"id": {
+						"content": {
 							Type:     schema.String,
 							Required: true,
-							Desc:     "Unique step identifier.",
-						},
-						"description": {
-							Type:     schema.String,
-							Required: true,
-							Desc:     "What this step accomplishes.",
+							Desc:     "What the task is - a short imperative line.",
 						},
 						"status": {
-							Type: schema.String,
-							Desc: "Step state: pending, in_progress, or completed.",
-							Enum: []string{"pending", "in_progress", "completed"},
+							Type:     schema.String,
+							Required: true,
+							Desc:     "Step state: pending, in_progress or completed.",
+							Enum:     []string{TodoPending, TodoInProgress, TodoCompleted},
 						},
 					},
 				},
@@ -112,81 +86,27 @@ func (t *TodoWriteTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 	}, nil
 }
 
-// InvokableRun parses the plan and echoes a formatted task list. Stateless: no
-// persistence across calls.
+// InvokableRun validates the list, replaces the run's plan, and echoes the
+// resulting counts and list back to the model.
 func (t *TodoWriteTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...einotool.Option) (string, error) {
 	return guardedToolRun(ctx, todoWriteToolName, t.invokableRun, argumentsInJSON)
 }
 
-func (t *TodoWriteTool) invokableRun(_ context.Context, argumentsInJSON string) (string, error) {
+func (t *TodoWriteTool) invokableRun(ctx context.Context, argumentsInJSON string) (string, error) {
 	var args todoWriteArgs
 	if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
 		return "", fmt.Errorf("todo_write: parse arguments: %w", err)
 	}
-	if strings.TrimSpace(args.Task) == "" {
-		args.Task = "No task description provided"
+	todos, err := canonicalTodos(args.Todos)
+	if err != nil {
+		return "", fmt.Errorf("todo_write: %w", err)
 	}
-	return generatePlanOutput(args.Task, args.Steps), nil
-}
-
-// generatePlanOutput formats the plan. Emoji are intentionally omitted.
-func generatePlanOutput(task string, steps []planStep) string {
-	var b strings.Builder
-	b.WriteString("Plan created\n\n")
-	fmt.Fprintf(&b, "**Task**: %s\n\n", task)
-
-	if len(steps) == 0 {
-		b.WriteString("Note: No specific steps provided. It is recommended to create 3-7 retrieval tasks for systematic research.\n\n")
-		b.WriteString("Suggested retrieval workflow (retrieval only, excluding summarization):\n")
-		b.WriteString("1. Use grep_chunks to search keywords and locate relevant documents\n")
-		b.WriteString("2. Use search_semantic_chunks for semantic search to retrieve relevant content\n")
-		b.WriteString("\nNote: Summarization and synthesis are handled by the think tool. Do not add summarization tasks here.\n")
-		return b.String()
+	plan := todoPlanFrom(ctx)
+	if plan == nil {
+		// The list is per-run state; without a run there is nowhere to write it,
+		// and silently accepting the call would make the client view diverge
+		// from what the model believes it recorded.
+		return "", errors.New("todo_write: no todo plan in this run")
 	}
-
-	pending, inProgress, completed := 0, 0, 0
-	for _, s := range steps {
-		switch s.Status {
-		case "pending":
-			pending++
-		case "in_progress":
-			inProgress++
-		case "completed":
-			completed++
-		}
-	}
-
-	b.WriteString("**Plan Steps**:\n\n")
-	for i, s := range steps {
-		fmt.Fprintf(&b, "  %d. [%s] %s\n", i+1, s.Status, s.Description)
-	}
-
-	b.WriteString("\n=== Task Progress ===\n")
-	fmt.Fprintf(&b, "Total: %d tasks\n", len(steps))
-	fmt.Fprintf(&b, "Completed: %d\n", completed)
-	fmt.Fprintf(&b, "In Progress: %d\n", inProgress)
-	fmt.Fprintf(&b, "Pending: %d\n", pending)
-
-	b.WriteString("\n=== Important Reminder ===\n")
-	if pending+inProgress > 0 {
-		fmt.Fprintf(&b, "%d tasks remaining!\n\n", pending+inProgress)
-		b.WriteString("All tasks must be completed before summarizing or drawing conclusions.\n\n")
-		b.WriteString("Next steps:\n")
-		if inProgress > 0 {
-			b.WriteString("- Continue completing tasks currently in progress\n")
-		}
-		if pending > 0 {
-			fmt.Fprintf(&b, "- Start processing %d pending tasks\n", pending)
-			b.WriteString("- Complete each task in order, do not skip\n")
-		}
-		b.WriteString("- After completing each task, update todo_write to mark it as completed\n")
-		b.WriteString("- Only generate the final summary after all tasks are completed\n")
-	} else {
-		b.WriteString("All tasks completed!\n\n")
-		b.WriteString("You can now:\n")
-		b.WriteString("- Synthesize findings from all tasks\n")
-		b.WriteString("- Generate a complete final answer or report\n")
-	}
-
-	return b.String()
+	return formatTodoState(plan.replace(todos)), nil
 }

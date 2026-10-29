@@ -276,6 +276,12 @@ func (s *ChatPipelineService) agenticRag(
 					})
 				}
 			},
+			// A todo write is not a token delta: it ships on its own chunk so a
+			// client can render the plan without parsing model prose.
+			OnTodo: func(state agentic_rag.TodoState) {
+				snapshot := state
+				emitResult(AsyncChatResult{Todo: &snapshot})
+			},
 		})
 		if thinking {
 			emitResult(AsyncChatResult{Final: false, EndToThink: true})

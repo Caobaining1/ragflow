@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"ragflow/internal/agentic_rag"
 	"ragflow/internal/common"
 	"ragflow/internal/engine"
 	"ragflow/internal/storage"
@@ -1317,6 +1318,9 @@ func (s *ChatSessionService) ChatCompletions(
 	if stream && streamChan != nil {
 		var fullAnswer strings.Builder
 		var finalLegacyAnswer map[string]interface{}
+		// The turn's latest todo list: persisted onto the assistant message so a
+		// reloaded conversation still shows the plan the answer was built with.
+		var turnTodo *agentic_rag.TodoState
 
 		for result := range resultChan {
 			if result.Reference != nil && len(reference) > 0 {
@@ -1331,6 +1335,7 @@ func (s *ChatSessionService) ChatCompletions(
 						content = result.Answer
 					}
 					s.appendAssistantToSession(session, content, messageID)
+					s.attachAssistantTodo(session, turnTodo)
 					if ctx.Err() == nil {
 						s.updateSessionMessages(ctx, session, s.getSessionMessagesAsSlice(session), reference)
 					}
@@ -1384,6 +1389,10 @@ func (s *ChatSessionService) ChatCompletions(
 				// Same structured step channel as the non-legacy path.
 				if result.ThinkEvent != nil {
 					ans["think_event"] = result.ThinkEvent
+				}
+				if result.Todo != nil {
+					turnTodo = result.Todo
+					ans["todo"] = result.Todo
 				}
 				if chatID != "" {
 					ans["chat_id"] = chatID
@@ -1466,6 +1475,10 @@ func (s *ChatSessionService) ChatCompletions(
 				if result.ThinkEvent != nil {
 					ans["think_event"] = result.ThinkEvent
 				}
+				if result.Todo != nil {
+					turnTodo = result.Todo
+					ans["todo"] = result.Todo
+				}
 				if chatID != "" {
 					ans["chat_id"] = chatID
 				}
@@ -1523,7 +1536,11 @@ func accumulateNonStreamAnswer(resultChan <-chan AsyncChatResult) map[string]int
 	var createdAt float64
 	var usage *ChatTurnUsage
 	var elapsedMs float64
+	var todo *agentic_rag.TodoState
 	for result := range resultChan {
+		if result.Todo != nil {
+			todo = result.Todo
+		}
 		if result.Final {
 			// The final event carries the complete (decorated) answer;
 			// it replaces any accumulated deltas rather than appending.
@@ -1562,6 +1579,9 @@ func accumulateNonStreamAnswer(resultChan <-chan AsyncChatResult) map[string]int
 	}
 	if elapsedMs > 0 {
 		ans["elapsed_ms"] = elapsedMs
+	}
+	if todo != nil {
+		ans["todo"] = todo
 	}
 	return ans
 }
@@ -1788,6 +1808,26 @@ func (s *ChatSessionService) appendAssistantToSession(session *entity.ChatSessio
 	session.Message, _ = json.Marshal(messages)
 }
 
+// attachAssistantTodo stores the turn's todo list on the assistant message that
+// just received the final answer. The list is turn-scoped UI state: a reloaded
+// conversation replays it from the stored messages, and the next turn starts
+// without one.
+func (s *ChatSessionService) attachAssistantTodo(session *entity.ChatSession, todo *agentic_rag.TodoState) {
+	if session == nil || todo == nil {
+		return
+	}
+	messages := parseMessages(session.Message)
+	if len(messages) == 0 {
+		return
+	}
+	last := messages[len(messages)-1]
+	if role, _ := last["role"].(string); role != "assistant" {
+		return
+	}
+	last["todo"] = todo
+	session.Message, _ = json.Marshal(messages)
+}
+
 // compactSessionAssistant replaces the assistant content in the in-memory
 // session snapshot with a non-blank final answer. It does not write to the DAO;
 // any persistence is handled by the caller. A blank final leaves the accumulated
@@ -1886,6 +1926,8 @@ type sseAnswerChunk struct {
 	StartToThink bool                   `json:"start_to_think,omitempty"`
 	EndToThink   bool                   `json:"end_to_think,omitempty"`
 	ThinkEvent   interface{}            `json:"think_event,omitempty"`
+	// Todo rides the chunk a todo_write produced; absent on every other chunk.
+	Todo interface{} `json:"todo,omitempty"`
 	// What the turn cost. Only the final event carries it: a delta is partial
 	// and would need merging, and a zero total would render as "0 tokens",
 	// which reads as a measurement rather than an absence.
@@ -2024,6 +2066,7 @@ func sseMarshalChunk(ans map[string]interface{}, chatID string) string {
 		StartToThink: startToThink,
 		EndToThink:   endToThink,
 		ThinkEvent:   ans["think_event"],
+		Todo:         ans["todo"],
 	}
 	wrapper := sseWrapper{Code: 0, Message: "success", Data: chunk}
 	return marshalJSONWithSpaces(wrapper)
@@ -2155,6 +2198,11 @@ func (s *ChatSessionService) structureAnswerWithConv(session *entity.ChatSession
 		lastMsg["created_at"] = float64(time.Now().UnixNano()) / 1e9
 		lastMsg["id"] = messageID
 		messages[lastIdx] = lastMsg
+	}
+	// A turn's todo list rides with its assistant message, so the plan is
+	// replayed from the stored conversation instead of the live stream only.
+	if todo, ok := ans["todo"]; ok && todo != nil && len(messages) > 0 {
+		messages[len(messages)-1]["todo"] = todo
 	}
 
 	session.Message, _ = json.Marshal(messages)

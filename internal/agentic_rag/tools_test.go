@@ -154,32 +154,6 @@ func TestThinkTool_InvalidNumber(t *testing.T) {
 	}
 }
 
-// === todo_write ===
-
-func TestTodoWriteTool_Echo(t *testing.T) {
-	out, err := NewTodoWriteTool().InvokableRun(context.Background(),
-		`{"task":"find X","steps":[{"id":"1","description":"search","status":"completed"},{"id":"2","description":"read","status":"pending"}]}`)
-	if err != nil {
-		t.Fatalf("InvokableRun: %v", err)
-	}
-	if !strings.Contains(out, "Completed: 1") || !strings.Contains(out, "Pending: 1") {
-		t.Errorf("unexpected output: %q", out)
-	}
-	if strings.Contains(out, "✅") || strings.Contains(out, "🔍") {
-		t.Errorf("emoji must not appear: %q", out)
-	}
-}
-
-func TestTodoWriteTool_EmptySteps(t *testing.T) {
-	out, err := NewTodoWriteTool().InvokableRun(context.Background(), `{"task":"find X","steps":[]}`)
-	if err != nil {
-		t.Fatalf("InvokableRun: %v", err)
-	}
-	if !strings.Contains(out, "grep_chunks") || !strings.Contains(out, "search_semantic_chunks") {
-		t.Errorf("suggested workflow missing: %q", out)
-	}
-}
-
 // === grep_chunks scoring / snippet ===
 
 func TestScoreGrepChunks_ScoreAndDedupe(t *testing.T) {
